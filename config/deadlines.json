@@ -1,0 +1,10 @@
+{
+  "_comment": "Deadline quick-picks for the new-task form. Edit freely and restart the app. day: today | tomorrow | monday..sunday | +N (days from today). time: HH:MM (24-hour). The form adds a leading blank and a trailing 'custom...' text entry.",
+  "options": [
+    { "label": "by end of day",       "day": "today",    "time": "23:59" },
+    { "label": "by end of morning",   "day": "today",    "time": "12:00" },
+    { "label": "by end of afternoon", "day": "today",    "time": "17:00" },
+    { "label": "tomorrow",            "day": "tomorrow", "time": "23:59" },
+    { "label": "end of week",         "day": "sunday",   "time": "23:59" }
+  ]
+}

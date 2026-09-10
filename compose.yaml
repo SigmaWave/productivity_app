@@ -4,6 +4,8 @@ services:
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: productivity_db
+    ports:
+      - "5432:5432"
     volumes:
       - ./db:/var/lib/postgresql
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql

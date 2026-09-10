@@ -2,3 +2,9 @@
 .env
 .dockerignore
 db
+.venv/
+__pycache__/
+*.pyc
+*.sql
+migrations/
+db/
