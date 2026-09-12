@@ -50,30 +50,88 @@ def add_task(
     return row
 
 
-def _priority_sql() -> str:
+def _priority_sql(prefix: str = "") -> str:
     # Higher score = do sooner. Deadline within 7 days adds up to 1.0.
-    return """
-        COALESCE(urgent, 0.5) * 1.0
-      + COALESCE(importance, 0.5) * 1.0
+    # `prefix` (e.g. "t.") qualifies the column names for queries that join
+    # in another table sharing them, like recurring_tasks in open_tasks_full.
+    return f"""
+        COALESCE({prefix}urgent, 0.5) * 1.0
+      + COALESCE({prefix}importance, 0.5) * 1.0
       + CASE
-            WHEN deadline IS NULL THEN 0
-            WHEN deadline <= now() THEN 1.5
-            ELSE GREATEST(0, 1.0 - EXTRACT(EPOCH FROM (deadline - now())) / 604800.0)
+            WHEN {prefix}deadline IS NULL THEN 0
+            WHEN {prefix}deadline <= now() THEN 1.5
+            ELSE GREATEST(0, 1.0 - EXTRACT(EPOCH FROM ({prefix}deadline - now())) / 604800.0)
         END
     """
 
 
+# tasks with no sort_order (nothing has ever been dragged, or it's new since
+# the last drag) fall back to the computed priority score; once anything has
+# a sort_order it's placed by that instead, ahead of the priority-sorted rest
+_ORDER_BY = """
+    ORDER BY ({pfx}pinned_at IS NOT NULL) DESC,
+             ({pfx}sort_order IS NULL) ASC, {pfx}sort_order ASC,
+             priority DESC, {pfx}created_at ASC
+"""
+
+
 def open_tasks(limit: int | None = None) -> list[dict[str, Any]]:
-    """Unfinished tasks, most important first."""
+    """Unfinished tasks, most important first. A task pinned via
+    :func:`set_active_task` always sorts first; behind that, any tasks
+    manually reordered via :func:`reorder_tasks` come next in that order,
+    ahead of the rest sorted by the computed priority score."""
     sql = f"""
         SELECT *, ({_priority_sql()}) AS priority
         FROM tasks
         WHERE done < 1
-        ORDER BY priority DESC, created_at ASC
+        {_ORDER_BY.format(pfx="")}
     """
     if limit is not None:
         sql += " LIMIT %(limit)s"
     return db.query(sql, {"limit": limit})
+
+
+def open_tasks_full() -> list[dict[str, Any]]:
+    """Every unfinished task, most important first (same ordering as
+    :func:`open_tasks`), each also carrying its recurrence rule as
+    ``recurrence`` (``None`` for a one-off task) — for the full "tasks" list
+    window, which shows every open task rather than just the visible few."""
+    sql = f"""
+        SELECT t.*, ({_priority_sql("t.")}) AS priority, r.recurrence AS recurrence
+        FROM tasks t
+        LEFT JOIN recurring_tasks r ON r.id = t.recurring_id
+        WHERE t.done < 1
+        {_ORDER_BY.format(pfx="t.")}
+    """
+    return db.query(sql)
+
+
+def set_active_task(task_id: int) -> dict[str, Any] | None:
+    """Pin one open task as the active task, unpinning whichever task (if
+    any) held that spot before it."""
+    db.execute(
+        "UPDATE tasks SET pinned_at = NULL WHERE pinned_at IS NOT NULL AND id != %s",
+        (task_id,),
+    )
+    return db.execute(
+        "UPDATE tasks SET pinned_at = now() WHERE id = %s RETURNING *",
+        (task_id,),
+    )
+
+
+def reorder_tasks(ordered_ids: list[int]) -> None:
+    """Persist a manual order for open tasks — drag-to-reorder in the tasks
+    list window. Assigns each id a spaced-out sort_order (10, 20, 30, …) so
+    it sorts in exactly this sequence ahead of the computed priority score
+    (see :data:`_ORDER_BY`); a task not in ``ordered_ids`` keeps whatever
+    sort_order it already had."""
+    if not ordered_ids:
+        return
+    with db.cursor() as cur:
+        cur.executemany(
+            "UPDATE tasks SET sort_order = %s WHERE id = %s",
+            [(i * 10, task_id) for i, task_id in enumerate(ordered_ids, start=1)],
+        )
 
 
 def open_task_count() -> int:

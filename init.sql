@@ -14,7 +14,13 @@ CREATE TABLE tasks (
     manual SMALLINT CHECK (manual IN (0, 1)) DEFAULT 1,
     -- Phase 4: link back to the recurring definition that generated this task
     recurring_id INTEGER,
-    created_at TIMESTAMPTZ DEFAULT now()
+    created_at TIMESTAMPTZ DEFAULT now(),
+    -- set when the user clicks a task's name to make it the active task;
+    -- at most one row has this set at a time (see app/tasks.py:set_active_task)
+    pinned_at TIMESTAMPTZ,
+    -- manual drag-to-reorder position from the tasks list window, spaced
+    -- 10 apart; NULL until the user has dragged anything (see reorder_tasks)
+    sort_order INTEGER
 );
 
 CREATE TABLE session (

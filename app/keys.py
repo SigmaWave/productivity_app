@@ -126,20 +126,24 @@ class KeystrokeTracker:
 # stats queries (read straight from Postgres — flush() first for freshness)
 # --------------------------------------------------------------------------
 
-def cpm_series(minutes: int = STATS_WINDOW_MINUTES) -> list[int]:
-    """Per-minute counts of ``char`` presses, oldest first, zero-filled."""
+def cpm_series(minutes: int = STATS_WINDOW_MINUTES, bucket_minutes: int = 1) -> list[int]:
+    """Chars/min rate per bucket, oldest first, zero-filled. ``bucket_minutes``
+    groups multiple minutes into one bar (each still a chars/min rate, not a
+    raw count) so wide windows — a day or more — stay readable as a chart."""
+    buckets = max(1, minutes // bucket_minutes)
     rows = db.query(
         """
-        SELECT floor(extract(epoch from (now() - ts)) / 60)::int AS ago,
+        SELECT floor(extract(epoch from (now() - ts)) / 60 / %s)::int AS ago,
                COUNT(*) AS n
         FROM keystroke
         WHERE kind = 'char' AND ts >= now() - make_interval(mins => %s)
         GROUP BY ago
         """,
-        (minutes,),
+        (bucket_minutes, minutes),
     )
     by_ago = {int(r["ago"]): int(r["n"]) for r in rows}
-    return [by_ago.get(minutes - 1 - i, 0) for i in range(minutes)]
+    return [round(by_ago.get(buckets - 1 - i, 0) / bucket_minutes)
+            for i in range(buckets)]
 
 
 def rolling_average(series: list[float], window: int = 20) -> list[float]:

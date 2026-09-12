@@ -22,8 +22,17 @@ lengths.
 
 ### Phase 2.2: Link interface with database ✅
 `app/db.py` (shared psycopg connection) + `app/tasks.py` / `app/pomodoro.py`.
-The panel reads tasks live; clicking a task row writes `done` / `finished_date`
-back. Finishing a Pomodoro logs a `session` row.
+The panel reads tasks live. Each row splits into a `[ ]` checkbox and the task
+name: clicking the checkbox completes the task (writes `done` / `finished_date`)
+and, after standing checked for 0.5 s, fades out over 2 s before the rest of the
+list moves up; clicking the name instead pins that task as the active one
+(`tasks.pinned_at`, `migrations/005_task_pin.sql`), replacing whichever task was
+pinned before it. Finishing a Pomodoro logs a `session` row. The "N more in
+queue" line opens a **tasks list** window — every open task as a
+`# | Task | Deadline | Repeat` table, paged 6 at a time with `▴`/`▾`. Press and
+drag a row to reorder it; the new order is written to `tasks.sort_order`
+(`migrations/006_task_sort_order.sql`) and, once anything has been dragged,
+takes precedence over the computed priority score everywhere tasks are shown.
 
 ### Phase 2.3: Set up icon on task bar ✅
 🍅 tomato icon in the menu bar; switches to a live `MM:SS` countdown (☕ on
