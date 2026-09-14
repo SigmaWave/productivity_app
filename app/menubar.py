@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import random
 import time
-from datetime import date, datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta, timezone
 
 import objc
 from AppKit import (
@@ -81,7 +81,7 @@ from AppKit import (
 from Foundation import NSMakeRange, NSObject
 from PyObjCTools import AppHelper
 
-from . import config, db, deadlines, keys, pomodoro, recurring, tasks
+from . import config, db, deadlines, jobsearch, keys, pomodoro, recurring, tasks
 
 try:
     from .hotkey import CONTROL as _HK_CONTROL, SHIFT as _HK_SHIFT, GlobalHotKey
@@ -154,6 +154,9 @@ TASK_CHECK_FADE_S = 2.0
 
 # full task-list window: tasks shown per page, paged with the up/down arrows
 TASKLIST_PAGE_SIZE = 6
+
+# jobs table (stats screen): applications shown per page
+JOBTABLE_PAGE_SIZE = 6
 
 # active task + next two visible, then the "in queue" line, all fading down a
 # luminosity gradient (GRADIENT[3] is the queue line, kept from when a 4th task
@@ -233,6 +236,21 @@ def _table_row(order: str, desc: str, deadline: str, repeat: str) -> str:
             f"{_elide(repeat, _COL_REPEAT_W).ljust(_COL_REPEAT_W)}")
 
 
+# column widths (characters, monospace) for the jobs table (stats screen)
+_JOB_COL_ID_W = 3
+_JOB_COL_TS_W = 11        # "%m/%d %H:%M"
+_JOB_COL_TAKEN_W = 7      # e.g. "12.3m"
+_JOB_TABLE_ROW_W = (_JOB_COL_ID_W + 2 * _JOB_COL_TS_W + _JOB_COL_TAKEN_W
+                     + 3 * len(" | "))
+
+
+def _job_row(job_id: str, started: str, finished: str, taken: str) -> str:
+    return (f"{str(job_id).rjust(_JOB_COL_ID_W)} | "
+            f"{started.ljust(_JOB_COL_TS_W)} | "
+            f"{finished.ljust(_JOB_COL_TS_W)} | "
+            f"{taken.ljust(_JOB_COL_TAKEN_W)}")
+
+
 def _ui_font(size: float) -> NSFont:
     for name in ("Menlo", "Monaco", "Andale Mono", "Courier New"):
         font = NSFont.fontWithName_size_(name, size)
@@ -279,6 +297,7 @@ class TermButton(NSButton):
         self._text = ""
         self._base = _green(_BODY, 0.95)
         self._hover = _green(_HEAD, 1.0)
+        self._align = NSTextAlignmentLeft
         self.setBordered_(False)
         self.setFocusRingType_(NSFocusRingTypeNone)
         self.setFont_(_ui_font(12.5))
@@ -287,14 +306,24 @@ class TermButton(NSButton):
         return self
 
     @objc.python_method
-    def configure(self, text, base, hover):
+    def configure(self, text, base, hover, *, align=None):
         self._text, self._base, self._hover = text, base, hover
+        if align is not None:
+            self._align = align
+        self._paint(self._base)
+
+    @objc.python_method
+    def set_text(self, text):
+        """Update just the label, keeping the current colors/alignment —
+        for a button whose text ticks on a timer (e.g. the job-search
+        banner) without needing to re-supply its colors every time."""
+        self._text = text
         self._paint(self._base)
 
     @objc.python_method
     def _paint(self, color):
         para = NSMutableParagraphStyle.alloc().init()
-        para.setAlignment_(NSTextAlignmentLeft)
+        para.setAlignment_(self._align)
         para.setLineBreakMode_(NSLineBreakByTruncatingTail)
         self.setAttributedTitle_(
             NSAttributedString.alloc().initWithString_attributes_(
@@ -656,7 +685,7 @@ class MenuController(NSObject):
         self._last_generated = None
         self._ticks = 0
         # "tracking" | "transition" | "form" | "stats" | "timer" | "settings"
-        # | "tasklist"
+        # | "tasklist" | "jobsearch" | "jobstable"
         self._screen = "tracking"
         self._task_list_page = 0
         # drag-to-reorder state for the tasks-list window: the current
@@ -673,6 +702,25 @@ class MenuController(NSObject):
         self._tasklist_after_ids = []
         self._drag_task_id = None
         self._drag_moved = False
+        # job-search stopwatch: manually started, pausable, resets to 0 when
+        # the "+" counter is clicked (see jobApplied_/jobStopwatchStart_).
+        # elapsed_accum banks the time from segments already paused through;
+        # while running, the current segment (time.monotonic() since
+        # started_monotonic) is added on top of that. started_at is the wall
+        # -clock time of the very first start of this attempt (unchanged by
+        # pausing/resuming) — logged to Postgres as when the attempt began.
+        self._stopwatch_running = False
+        self._stopwatch_started_monotonic = 0.0
+        self._stopwatch_elapsed_accum = 0.0
+        self._stopwatch_started_at = None
+        self._stopwatch_label = None
+        # shrinks the job-search popover to a notification-banner-sized strip
+        # when you click elsewhere (the same outside-click monitor that
+        # normally closes the popover — see popoverDidShow_); clicking the
+        # banner itself (jobSearchExpand_) expands it back
+        self._jobsearch_compact = False
+        self._content_w = PANEL_W       # popover width; screens may override it
+        self._jobtable_page = 0
         self._flash_msg = ""
         self._flash_until = 0.0
         self._form_err = ""
@@ -768,7 +816,7 @@ class MenuController(NSObject):
     def _handle_key_event(self, event):
         flags = event.modifierFlags()
         code = event.keyCode()
-        if code == KEY_ESC and self.popover.isShown():
+        if code == KEY_ESC and self.popover.isShown() and self._screen != "jobsearch":
             self.popover.close()
             return None
         hotkey_live = self._hotkey is not None and self._hotkey.ok
@@ -818,12 +866,15 @@ class MenuController(NSObject):
                 self.rebuild()
         elif self.popover.isShown() and self._screen == "timer":
             self._render_timer()
+        elif self.popover.isShown() and self._screen == "jobsearch":
+            self._render_stopwatch()
 
     # -- popover open / close ------------------------------------------
 
     def togglePopover_(self, sender):
         if self.popover.isShown():
-            self.popover.close()
+            if self._screen != "jobsearch":
+                self.popover.close()
             return
         self._db_ok = db.ping()
         if self._db_ok:
@@ -848,8 +899,20 @@ class MenuController(NSObject):
     def popoverDidShow_(self, notification):
         self._monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
             NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown,
-            lambda event: self.popover.performClose_(None),
+            self._handle_outside_click,
         )
+
+    @objc.python_method
+    def _handle_outside_click(self, event):
+        # normally an outside click just dismisses the popover; on the job
+        # search screen it instead shrinks it to a banner (still open — only
+        # jobSearchBack_/jobSearchExpand_ leave or restore it from here)
+        if self._screen == "jobsearch":
+            if not self._jobsearch_compact:
+                self._jobsearch_compact = True
+                self.rebuild()
+            return
+        self.popover.performClose_(None)
 
     def popoverDidClose_(self, notification):
         self._cancel_transition()
@@ -973,6 +1036,110 @@ class MenuController(NSObject):
         self._settings_err = ""
         self._start_transition("settings")
 
+    # -- job search -------------------------------------------------
+    # Deliberately "sticky": while this screen is up, the popover ignores
+    # both the outside-click-to-dismiss monitor (popoverDidShow_) and Esc
+    # (_handle_key_event) — only jobSearchBack_ can leave it. An outside click
+    # shrinks it to a banner instead of closing it (_handle_outside_click);
+    # clicking the banner (jobSearchExpand_) expands it back.
+
+    def openJobSearch_(self, sender):
+        self._cancel_transition()
+        self._screen = "jobsearch"
+        self.rebuild()
+
+    def jobStopwatchStart_(self, sender):
+        # this button doubles as pause: running -> bank the segment and stop;
+        # idle -> start a fresh attempt (elapsed 0) or resume a paused one
+        # (elapsed_accum already holds whatever was banked before the pause)
+        if self._stopwatch_running:
+            self._stopwatch_elapsed_accum += (
+                time.monotonic() - self._stopwatch_started_monotonic)
+            self._stopwatch_running = False
+        else:
+            if self._stopwatch_started_at is None:
+                self._stopwatch_started_at = datetime.now(timezone.utc)
+            self._stopwatch_started_monotonic = time.monotonic()
+            self._stopwatch_running = True
+        self.rebuild()
+
+    def jobStopwatchReset_(self, sender):
+        # back to 0 with nothing logged — unlike jobApplied_, no db write
+        self._stopwatch_running = False
+        self._stopwatch_started_monotonic = 0.0
+        self._stopwatch_elapsed_accum = 0.0
+        self._stopwatch_started_at = None
+        self.rebuild()
+
+    def jobApplied_(self, sender):
+        current_segment = (time.monotonic() - self._stopwatch_started_monotonic
+                            if self._stopwatch_running else 0.0)
+        elapsed = self._stopwatch_elapsed_accum + current_segment
+        started_at = self._stopwatch_started_at
+        try:
+            jobsearch.log_application(started_at, elapsed if started_at is not None else None)
+        except Exception as exc:  # noqa: BLE001
+            self._flash(f"err: {exc}")
+            self.rebuild()
+            return
+        print(f"Job applied to in {elapsed / 60:.1f} min")
+        # counter logged — the stopwatch resets and waits to be started again
+        self._stopwatch_running = False
+        self._stopwatch_started_monotonic = 0.0
+        self._stopwatch_elapsed_accum = 0.0
+        self._stopwatch_started_at = None
+        self.rebuild()
+
+    def jobApplicationRemove_(self, sender):
+        # "-": undo the last "+" — doesn't touch the stopwatch, just the count
+        try:
+            removed = jobsearch.remove_last_application()
+        except Exception as exc:  # noqa: BLE001
+            self._flash(f"err: {exc}")
+            self.rebuild()
+            return
+        if removed:
+            self._flash("removed last application")
+        self.rebuild()
+
+    def jobSearchBack_(self, sender):
+        self._jobsearch_compact = False
+        self._screen = "tracking"
+        self.rebuild()
+
+    def jobSearchExpand_(self, sender):
+        # clicking the banner (only visible while compact) restores it
+        self._jobsearch_compact = False
+        self.rebuild()
+
+    @objc.python_method
+    def _render_stopwatch(self):
+        if self._stopwatch_label is None:
+            return
+        if self._jobsearch_compact:
+            self._stopwatch_label.set_text(self._jobsearch_banner_text())
+        else:
+            self._stopwatch_label.setStringValue_(self._stopwatch_text())
+
+    # -- jobs table (from the stats screen) --------------------------
+
+    def openJobsTable_(self, sender):
+        self._jobtable_page = 0
+        self._screen = "jobstable"
+        self.rebuild()
+
+    def jobsTableBack_(self, sender):
+        self._screen = "stats"
+        self.rebuild()
+
+    def jobTableUp_(self, sender):
+        self._jobtable_page = max(0, self._jobtable_page - 1)
+        self.rebuild()
+
+    def jobTableDown_(self, sender):
+        self._jobtable_page += 1
+        self.rebuild()
+
     def quit_(self, sender):
         self.tracker.flush()
         self.tracker.stop()
@@ -1032,6 +1199,18 @@ class MenuController(NSObject):
 
     def taskListBack_(self, sender):
         self._screen = "tracking"
+        self.rebuild()
+
+    def taskListComplete_(self, sender):
+        # the "X" at the end of a row: complete it right here, no fade
+        # animation (that's a tracking-screen-only affordance) — just refetch
+        # and reflow the table
+        task_id = int(sender.tag())
+        try:
+            tasks.complete_task(task_id)
+            self._flash("task done ✓")
+        except Exception as exc:  # noqa: BLE001
+            self._flash(f"err: {exc}")
         self.rebuild()
 
     # -- tasks-list drag-to-reorder ---------------------------------
@@ -1454,9 +1633,10 @@ class MenuController(NSObject):
 
     @objc.python_method
     def _button(self, frame, text, action, *, rgb=_BODY, alpha=0.95,
-                hover_rgb=_HEAD, tag=None):
+                hover_rgb=_HEAD, tag=None, align=None):
         btn = TermButton.alloc().initWithFrame_(frame)
-        btn.configure(text, _green(rgb, alpha), _green(hover_rgb, min(1.0, alpha + 0.45)))
+        btn.configure(text, _green(rgb, alpha), _green(hover_rgb, min(1.0, alpha + 0.45)),
+                      align=align)
         btn.setTarget_(self)
         btn.setAction_(action)
         if tag is not None:
@@ -1497,6 +1677,7 @@ class MenuController(NSObject):
         for sub in list(self.view.subviews()):
             sub.removeFromSuperview()
         separators: list[float] = []
+        self._content_w = PANEL_W    # only jobsearch-compact narrows this
         y = PAD
         if self._screen == "form":
             y = self._build_form(y, separators)
@@ -1508,13 +1689,17 @@ class MenuController(NSObject):
             y = self._build_timer(y, separators)
         elif self._screen == "tasklist":
             y = self._build_tasklist(y, separators)
+        elif self._screen == "jobsearch":
+            y = self._build_jobsearch(y, separators)
+        elif self._screen == "jobstable":
+            y = self._build_jobstable(y, separators)
         elif self._screen == "transition":
             y = self._build_transition(y)
         else:
             y = self._build_tracking(y, separators)
 
         self.view.separators = separators
-        size = NSMakeSize(PANEL_W, y)
+        size = NSMakeSize(self._content_w, y)
         self.popover.setContentSize_(size)
         self.view.setFrameSize_(size)
         self.view.setNeedsDisplay_(True)
@@ -1633,6 +1818,10 @@ class MenuController(NSObject):
                 rgb=_HEAD if selected else _BODY,
                 alpha=1.0 if selected else 0.30, tag=i))
             ly += 19
+        # not a metric of this chart — navigates to the jobs log table instead
+        self.view.addSubview_(self._button(
+            NSMakeRect(PAD + 8, ly, 84, 18), "jobs", "openJobsTable:",
+            rgb=_BODY, alpha=0.30))
 
         # diff only: a ">" at the chart's top-right widens the x-axis by 250 ms
         if metric == "diff":
@@ -1764,6 +1953,7 @@ class MenuController(NSObject):
             ("+ add task", "openForm:"),
             ("▶ Pomodoro", "openPomodoro:"),
             ("▚ stats", "openStats:"),
+            ("⌕ job search", "openJobSearch:"),
             ("⏻ quit", "quit:"),
         ]
         for i, (text, action) in enumerate(grid):
@@ -1886,7 +2076,10 @@ class MenuController(NSObject):
             y += ROW_H
         else:
             # click-and-drag a row to reorder it among its page-mates; the
-            # new order is written back once the drag ends (task_row_drag_ended)
+            # new order is written back once the drag ends (task_row_drag_ended).
+            # the row leaves room for an "X" at the end to complete it on the spot.
+            x_w, x_gap = 20, 4
+            row_w = table_w - x_w - x_gap
             self._tasklist_row_top = y
             self._tasklist_row_step = 16.0
             self._tasklist_before_ids = [int(r["id"]) for r in rows[:start]]
@@ -1895,13 +2088,17 @@ class MenuController(NSObject):
                 task_id = int(task["id"])
                 deadline = task.get("deadline")
                 deadline_s = f"{deadline:%m/%d}" if deadline else "—"
-                row = TaskRow.alloc().initWithFrame_(NSMakeRect(PAD, y, table_w, 16))
+                row = TaskRow.alloc().initWithFrame_(NSMakeRect(PAD, y, row_w, 16))
                 row.configure(self, task_id, task["description"], deadline_s,
                               _repeat_label(task.get("recurrence")), start + i + 1,
                               _BODY, 0.9)
                 self.view.addSubview_(row)
                 self._tasklist_row_order.append(task_id)
                 self._tasklist_row_views[task_id] = row
+                self.view.addSubview_(self._button(
+                    NSMakeRect(PAD + row_w + x_gap, y, x_w, 16), "X",
+                    "taskListComplete:", rgb=_BODY, alpha=0.5, hover_rgb=_HEAD,
+                    tag=task_id))
                 y += 16
 
         y += 10
@@ -1931,6 +2128,197 @@ class MenuController(NSObject):
         self.view.addSubview_(self._button(
             NSMakeRect(PAD + half + 12, y, half, ROW_H), "+ add", "openForm:",
             rgb=_HEAD, alpha=0.95))
+        y += ROW_H
+        return SHEET_H
+
+    @objc.python_method
+    def _stopwatch_text(self):
+        current_segment = (time.monotonic() - self._stopwatch_started_monotonic
+                            if self._stopwatch_running else 0.0)
+        secs = int(self._stopwatch_elapsed_accum + current_segment)
+        return f"{secs // 60:d}:{secs % 60:02d}"
+
+    @objc.python_method
+    def _jobsearch_banner_text(self):
+        return f"⌕ job search   {self._stopwatch_text()}"
+
+    @objc.python_method
+    def _build_jobsearch(self, y, separators):
+        self._header = None
+        if self._jobsearch_compact:
+            return self._build_jobsearch_compact()
+
+        count = 0
+        if self._db_ok:
+            try:
+                count = jobsearch.count_today()
+            except Exception:  # noqa: BLE001
+                self._db_ok = False
+
+        self.view.addSubview_(self._label(
+            NSMakeRect(PAD, y, PANEL_W - 2 * PAD, 36),
+            "JOB SEARCH\n  time-boxed applications", size=13, rgb=_HEAD,
+            alpha=1.0, lines=2))
+        y += 42
+        separators.append(y)
+        y += 14
+
+        self.view.addSubview_(self._label(
+            NSMakeRect(0, y, PANEL_W, 16), "jobs applied today", size=12,
+            rgb=_HEAD, alpha=0.6, align=NSTextAlignmentCenter))
+        y += 24
+
+        # "-" undoes the last logged application (jobsearch.remove_last_application);
+        # "+" logs one the same way "+ applied" used to (jobApplied_) — both
+        # flank the count so it reads as a plain increment/decrement counter
+        count_h, side_w = 42, 32
+        side_y = y + (count_h - side_w) / 2
+        self.view.addSubview_(self._button(
+            NSMakeRect(PAD, side_y, side_w, side_w), "-",
+            "jobApplicationRemove:", rgb=_BODY,
+            alpha=0.85 if count > 0 else 0.3, align=NSTextAlignmentCenter))
+        self.view.addSubview_(self._label(
+            NSMakeRect(0, y, PANEL_W, count_h), str(count), size=34,
+            rgb=_HEAD, alpha=1.0, align=NSTextAlignmentCenter))
+        self.view.addSubview_(self._button(
+            NSMakeRect(PANEL_W - PAD - side_w, side_y, side_w, side_w), "+",
+            "jobApplied:", rgb=_HEAD, alpha=1.0, align=NSTextAlignmentCenter))
+        y += count_h + 4
+
+        if self._stopwatch_running:
+            status_text, status_rgb, status_alpha = "● running", _HEAD, 0.8
+        elif self._stopwatch_started_at is not None:
+            status_text, status_rgb, status_alpha = "‖ paused", _HEAD, 0.6
+        else:
+            status_text, status_rgb, status_alpha = "stopwatch", _BODY, 0.5
+        self.view.addSubview_(self._label(
+            NSMakeRect(0, y, PANEL_W, 14), status_text, size=10,
+            rgb=status_rgb, alpha=status_alpha, align=NSTextAlignmentCenter))
+        y += 16
+
+        self._stopwatch_label = self._label(
+            NSMakeRect(0, y, PANEL_W, 40), self._stopwatch_text(), size=30,
+            rgb=_HEAD, alpha=1.0, align=NSTextAlignmentCenter)
+        self.view.addSubview_(self._stopwatch_label)
+        y += 44
+
+        separators.append(y)
+        y += 14
+        half = (PANEL_W - 2 * PAD - 12) / 2
+        self.view.addSubview_(self._button(
+            NSMakeRect(PAD, y, half, ROW_H),
+            "⏸ pause" if self._stopwatch_running else "▶ start",
+            "jobStopwatchStart:", rgb=_BODY, alpha=0.85))
+        self.view.addSubview_(self._button(
+            NSMakeRect(PAD + half + 12, y, half, ROW_H), "↺ reset",
+            "jobStopwatchReset:", rgb=_BODY, alpha=0.85))
+        y += ROW_H + 8
+
+        separators.append(y)
+        y += 14
+        self.view.addSubview_(self._button(
+            NSMakeRect(PAD, y, 80, ROW_H), "‹ back", "jobSearchBack:",
+            rgb=_BODY, alpha=0.8))
+        y += ROW_H
+        return SHEET_H
+
+    @objc.python_method
+    def _build_jobsearch_compact(self):
+        # a notification-banner-sized strip (full width, short) shown after
+        # an outside click (_handle_outside_click); click it to expand back —
+        # there's no back button here on purpose, that's the only action.
+        h = 64
+        banner = self._button(
+            NSMakeRect(PAD, (h - ROW_H) / 2, PANEL_W - 2 * PAD, ROW_H),
+            self._jobsearch_banner_text(), "jobSearchExpand:",
+            rgb=_HEAD, alpha=0.95, align=NSTextAlignmentCenter)
+        self.view.addSubview_(banner)
+        self._stopwatch_label = banner
+        return h
+
+    @objc.python_method
+    def _build_jobstable(self, y, separators):
+        # every logged application as a compact table, paged like _build_tasklist
+        self._header = None
+        table_w = PANEL_W - 2 * PAD
+        rule = "-" * _JOB_TABLE_ROW_W
+
+        rows: list[dict] = []
+        if self._db_ok:
+            try:
+                rows = jobsearch.list_applications()
+            except Exception:  # noqa: BLE001
+                self._db_ok = False
+
+        self.view.addSubview_(self._label(
+            NSMakeRect(PAD, y, table_w, 20),
+            f"JOBS ({len(rows)})", size=13, rgb=_HEAD, alpha=1.0))
+        y += 26
+        separators.append(y)
+        y += 12
+
+        total = len(rows)
+        page_count = max(1, (total + JOBTABLE_PAGE_SIZE - 1) // JOBTABLE_PAGE_SIZE)
+        self._jobtable_page = max(0, min(self._jobtable_page, page_count - 1))
+        start = self._jobtable_page * JOBTABLE_PAGE_SIZE
+        page_rows = rows[start:start + JOBTABLE_PAGE_SIZE]
+
+        self.view.addSubview_(self._label(
+            NSMakeRect(PAD, y, table_w, 12), rule, size=10, rgb=_BODY, alpha=0.4))
+        y += 13
+        self.view.addSubview_(self._label(
+            NSMakeRect(PAD, y, table_w, 16),
+            _job_row("id", "started", "finished", "taken"),
+            size=11, rgb=_HEAD, alpha=0.85))
+        y += 16
+        self.view.addSubview_(self._label(
+            NSMakeRect(PAD, y, table_w, 12), rule, size=10, rgb=_BODY, alpha=0.4))
+        y += 16
+
+        if not page_rows:
+            self.view.addSubview_(self._label(
+                NSMakeRect(PAD, y, table_w, ROW_H),
+                "// no applications logged yet" if self._db_ok
+                else "// no connection — reconnecting…",
+                rgb=_BODY, alpha=0.7))
+            y += ROW_H
+        else:
+            for job in page_rows:
+                started = job.get("started_at")
+                finished = job.get("finished_at")
+                minutes = job.get("minutes")
+                started_s = f"{started:%m/%d %H:%M}" if started else "—"
+                finished_s = f"{finished:%m/%d %H:%M}" if finished else "—"
+                taken_s = f"{float(minutes):.1f}m" if minutes is not None else "—"
+                self.view.addSubview_(self._label(
+                    NSMakeRect(PAD, y, table_w, 16),
+                    _job_row(job["id"], started_s, finished_s, taken_s),
+                    size=11, rgb=_BODY, alpha=0.9))
+                y += 16
+
+        y += 10
+        separators.append(y)
+        y += 12
+
+        half = (PANEL_W - 2 * PAD - 12) / 2
+        self.view.addSubview_(self._button(
+            NSMakeRect(PAD, y, half, 20), "▴ up", "jobTableUp:",
+            rgb=_BODY, alpha=0.85 if self._jobtable_page > 0 else 0.25))
+        self.view.addSubview_(self._button(
+            NSMakeRect(PAD + half + 12, y, half, 20), "▾ down", "jobTableDown:",
+            rgb=_BODY, alpha=0.85 if self._jobtable_page < page_count - 1 else 0.25))
+        y += 24
+        self.view.addSubview_(self._label(
+            NSMakeRect(PAD, y, table_w, 12),
+            f"page {self._jobtable_page + 1}/{page_count}", size=9,
+            rgb=_BODY, alpha=0.4, align=NSTextAlignmentCenter))
+        y += 16
+
+        separators.append(y)
+        y += 14
+        self.view.addSubview_(self._button(
+            NSMakeRect(PAD, y, 80, ROW_H), "‹ back", "jobsTableBack:",
+            rgb=_BODY, alpha=0.8))
         y += ROW_H
         return SHEET_H
 

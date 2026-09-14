@@ -81,3 +81,21 @@ CREATE TABLE keystroke (
     kind TEXT NOT NULL CHECK (kind IN ('char', 'delete', 'other'))
 );
 CREATE INDEX keystroke_ts_idx ON keystroke (ts);
+
+-- Job Search screen (app/jobsearch.py, not one of the numbered phases below —
+-- "Phase 7" there is reserved for the scheduler). One row per click of the
+-- "+" counter: started_at is when the manually-started stopwatch began
+-- (NULL if it wasn't running), ts is when the counter was clicked, and
+-- elapsed_seconds is the stopwatch's reading measured with time.monotonic()
+-- — NOT derived as ts - started_at, since those come from different clocks
+-- (host wall clock vs. this container's) that can drift apart.
+-- timer_seconds / diff_seconds are reserved for a possible future
+-- preset-timer feature and stay NULL for now.
+CREATE TABLE job_applications (
+    id SERIAL PRIMARY KEY,
+    started_at TIMESTAMPTZ,
+    ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+    elapsed_seconds REAL,
+    timer_seconds REAL,
+    diff_seconds REAL
+);

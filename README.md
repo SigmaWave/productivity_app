@@ -68,6 +68,29 @@ in RAM and bulk-inserted into the `keystroke` table every 60 s (prints
 then restart) — until granted the monitor sees nothing and the app says so.
 Existing DBs: apply `migrations/004_keystroke.sql`.
 
+### Job Search (ad-hoc — not one of the numbered phases above)
+`app/jobsearch.py` + the **Job Search** screen (`⌕ job search` on the tracking
+screen). A manually-started, pausable stopwatch: `▶ start` begins it, and the
+same button becomes `⏸ pause` while running (pausing banks the elapsed time
+rather than losing it — `▶ start` then resumes from there); `↺ reset` zeros it
+with nothing logged. The **jobs applied today** counter sits between `-` and
+`+`: `+` logs one row to `job_applications` (`started_at` = when the
+stopwatch first began this attempt, `ts` = now, `elapsed_seconds` = the
+stopwatch reading, measured with `time.monotonic()` rather than
+`ts - started_at` — those two timestamps come from different clocks, host vs.
+the Postgres container, which can drift), prints `Job applied to in X.Y min`
+to the console, and resets the stopwatch to 0; `-` undoes the most recent
+`+` **from today** (matching the counter, which only counts today's rows —
+it never reaches back into a previous day). This screen is "sticky": Esc and
+the status-bar icon do nothing while it's open, and an outside click
+**shrinks it to a notification-banner-sized strip** (still open, not closed)
+instead of dismissing it; clicking that banner expands it back. `‹ back` is
+the only way to actually leave. The stats screen's `jobs` button opens a paged
+`id | started | finished | taken` table of every logged application (all
+time, not just today).
+Existing DBs: apply `migrations/007_job_applications.sql`,
+`migrations/008_job_started_at.sql`, and `migrations/009_job_elapsed_seconds.sql`.
+
 ---
 
 ## Running it
@@ -160,6 +183,7 @@ restart the app. (All hand-editable config JSON lives in `config/`.)
     `750+`) — never folded into a real bin. The **`›` button at the chart's
     top-right** widens the bound by 250 ms per click and redraws live, wrapping
     back to 750 ms after 3 s
+- `jobs` (below the metric legend) opens the jobs table — see Job Search above
 - `‹ back` returns to the tracking screen
 
 ## Inspecting the database
