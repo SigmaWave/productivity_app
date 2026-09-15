@@ -7,15 +7,21 @@ Run with ``python run.py``. A 🍅 lives in the status bar; Ctrl+Shift+Space
 Screens (``self._screen``):
 
 * **tracking** — plain black. Header (``⚙`` at top-right opens settings), then
-  the active task, the next two, and a "N more in queue" line fading down a
-  luminosity gradient. Buttons: ``+ add task``, start/stop Pomodoro, ``stats``,
-  quit.
+  the active task, the next two, and a "N more in queue" line (plain text, not
+  clickable) fading down a luminosity gradient. Buttons: ``Tasks`` (opens the
+  full task-list window), start/stop Pomodoro, ``stats``, quit.
 * **transition** — the base loader: ~1 s of full-screen "Matrix" rain before any
   sub-screen (form, stats, timer, settings) appears.
 * **timer** — shown after starting a Pomodoro: a big centred ``M:SS`` countdown
-  (``FOCUS`` / ``BREAK``) with the current task under it. ``■ stop`` ends and
-  logs it; ``‹ tasks`` returns to tracking with the timer still running. The
-  1 s tick updates the digits in place.
+  (``FOCUS`` / ``BREAK``) with the current task under it, then a 2×2 button
+  grid. ``■ stop`` freezes the countdown in place (still running, not ticking)
+  and becomes ``▶ continue``; ``↺ reset`` restarts the current phase from its
+  full duration, discarding progress, without logging anything; ``Tasks``
+  opens the full task-list window (remembering to come back here rather than
+  to tracking); ``⌂ main page`` returns to tracking, leaving the timer
+  running/paused untouched. Only a full countdown reaching zero logs and ends
+  the interval (``_pomodoro_finished``). The 1 s tick updates the digits in
+  place.
 * **settings** — the gear screen: ``pomodoro (min)`` and ``break (min)`` fields
   (``config.set_pomodoro_durations`` → ``config/pomodoro_settings.json``); ``save`` /
   ``cancel``.
@@ -41,6 +47,7 @@ Phase 6: every keystroke on the machine is timestamped in RAM and flushed to the
 from __future__ import annotations
 
 import random
+import threading
 import time
 from datetime import date, datetime, time as dtime, timedelta, timezone
 
@@ -81,7 +88,7 @@ from AppKit import (
 from Foundation import NSMakeRange, NSObject
 from PyObjCTools import AppHelper
 
-from . import config, db, deadlines, jobsearch, keys, pomodoro, recurring, tasks
+from . import config, db, deadlines, jobsearch, keys, llm_labels, pomodoro, recurring, tasks
 
 try:
     from .hotkey import CONTROL as _HK_CONTROL, SHIFT as _HK_SHIFT, GlobalHotKey
@@ -152,8 +159,14 @@ KEYSTROKE_FLUSH_SECONDS = 60
 TASK_CHECK_STAND_S = 0.5
 TASK_CHECK_FADE_S = 2.0
 
-# full task-list window: tasks shown per page, paged with the up/down arrows
+# full task-list window: tasks shown at once, and how many rows the up/down
+# arrows slide the visible window by (a partial overlap, not a hard page flip)
 TASKLIST_PAGE_SIZE = 6
+TASKLIST_SCROLL_STEP = 3
+
+# the tasks-list window is wider than every other screen (PANEL_W) to fit the
+# Phase 5 category/energy columns alongside the existing ones
+TASKLIST_PANEL_W = PANEL_W + 190
 
 # jobs table (stats screen): applications shown per page
 JOBTABLE_PAGE_SIZE = 6
@@ -225,15 +238,23 @@ _COL_ORDER_W = 3
 _COL_DESC_W = 20
 _COL_DEADLINE_W = 8
 _COL_REPEAT_W = 10
+# Phase 5: LLM labels — widths fit every value in llm_labels.CATEGORIES /
+# ENERGY_LEVELS without eliding ("deep_computer"/"physical_home" are the
+# longest categories at 13; "medium" the longest energy level at 6)
+_COL_CATEGORY_W = 13
+_COL_ENERGY_W = 6
 _TABLE_ROW_W = (_COL_ORDER_W + _COL_DESC_W + _COL_DEADLINE_W + _COL_REPEAT_W
-                + 3 * len(" | "))
+                + _COL_CATEGORY_W + _COL_ENERGY_W + 5 * len(" | "))
 
 
-def _table_row(order: str, desc: str, deadline: str, repeat: str) -> str:
+def _table_row(order: str, desc: str, deadline: str, repeat: str,
+                category: str, energy: str) -> str:
     return (f"{str(order).rjust(_COL_ORDER_W)} | "
             f"{_elide(desc, _COL_DESC_W).ljust(_COL_DESC_W)} | "
             f"{deadline.ljust(_COL_DEADLINE_W)} | "
-            f"{_elide(repeat, _COL_REPEAT_W).ljust(_COL_REPEAT_W)}")
+            f"{_elide(repeat, _COL_REPEAT_W).ljust(_COL_REPEAT_W)} | "
+            f"{_elide(category, _COL_CATEGORY_W).ljust(_COL_CATEGORY_W)} | "
+            f"{energy.ljust(_COL_ENERGY_W)}")
 
 
 # column widths (characters, monospace) for the jobs table (stats screen)
@@ -375,6 +396,7 @@ class TaskRow(NSView):
         self._text = ""
         self._color = _green(_BODY, 0.9)
         self._desc = self._deadline_s = self._repeat_s = ""
+        self._category_s = self._energy_s = ""
         self._drag_origin_y = 0.0
         self._frame_origin_y = 0.0
         return self
@@ -387,18 +409,21 @@ class TaskRow(NSView):
         ).drawAtPoint_(NSMakePoint(0, 1))
 
     @objc.python_method
-    def configure(self, controller, task_id, desc, deadline_s, repeat_s, order, rgb, alpha):
+    def configure(self, controller, task_id, desc, deadline_s, repeat_s,
+                  category_s, energy_s, order, rgb, alpha):
         self.controller = controller
         self.task_id = task_id
         # kept so set_order() can redraw the row with just a new "#" as it
         # moves during a drag, without the controller re-fetching from Postgres
         self._desc, self._deadline_s, self._repeat_s = desc, deadline_s, repeat_s
+        self._category_s, self._energy_s = category_s, energy_s
         self._color = _green(rgb, alpha)
         self.set_order(order)
 
     @objc.python_method
     def set_order(self, order):
-        self._text = _table_row(order, self._desc, self._deadline_s, self._repeat_s)
+        self._text = _table_row(order, self._desc, self._deadline_s,
+                                 self._repeat_s, self._category_s, self._energy_s)
         self.setNeedsDisplay_(True)
 
     def mouseDown_(self, event):
@@ -687,7 +712,13 @@ class MenuController(NSObject):
         # "tracking" | "transition" | "form" | "stats" | "timer" | "settings"
         # | "tasklist" | "jobsearch" | "jobstable"
         self._screen = "tracking"
-        self._task_list_page = 0
+        # row index of the first task shown in the tasks-list window; the
+        # up/down arrows slide this by TASKLIST_SCROLL_STEP, not a full page
+        self._task_list_offset = 0
+        # which screen to return to on the tasks-list "‹ back" button — set
+        # by openTaskList_ to whichever screen ("tracking" or "timer") it was
+        # opened from
+        self._tasklist_return_screen = "tracking"
         # drag-to-reorder state for the tasks-list window: the current
         # page's task ids in on-screen order (mutated live while dragging),
         # their TaskRow views, the geometry of that row band, and the ids
@@ -834,6 +865,7 @@ class MenuController(NSObject):
         self._db_ok = db.ping()
         if self._db_ok:
             self._generate_recurring(force=True)
+            self._label_backlog_async()
         self._update_status_title()
 
     @objc.python_method
@@ -846,8 +878,54 @@ class MenuController(NSObject):
             self._last_generated = today
             if created:
                 self._flash(f'+{len(created)} recurring task(s)')
+                for task in created:
+                    self._label_task_async(task["id"], task["description"])
         except Exception as exc:  # noqa: BLE001
             print(f"[recurring] {exc}")
+
+    # -- Phase 5: LLM labels (app/llm_labels.py) -------------------------
+    #
+    # Both calls below run the actual Ollama round trip on a background
+    # thread — it can take several seconds (longer on the very first call
+    # after Ollama starts, while the model loads) and must never freeze the
+    # popover. db.py serializes access to the shared connection, so it's
+    # safe for that thread to read/write the database directly; the only
+    # thing marshalled back to the main thread is the UI refresh.
+
+    @objc.python_method
+    def _label_task_async(self, task_id, description):
+        """Classify one just-created task in the background and refresh the
+        tasks-list window if it's the one currently on screen."""
+        def worker():
+            try:
+                llm_labels.label_task(task_id, description)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[llm_labels] task {task_id}: {exc}")
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "labelingDone:", None, False)
+        threading.Thread(target=worker, daemon=True).start()
+
+    @objc.python_method
+    def _label_backlog_async(self):
+        """Startup sweep: classify every task that doesn't have both labels
+        yet (app/llm_labels.unlabeled_tasks) — created before Phase 5 existed,
+        or left NULL by a previous failed call."""
+        def worker():
+            try:
+                updated = llm_labels.label_unlabeled_tasks()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[llm_labels] backlog sweep: {exc}")
+                updated = []
+            if updated:
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "labelingDone:", None, False)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def labelingDone_(self, arg):
+        # runs on the main thread (see performSelectorOnMainThread_ above);
+        # only worth a rebuild if the labels would actually be visible
+        if self.popover.isShown() and self._screen == "tasklist":
+            self.rebuild()
 
     # -- timer ----------------------------------------------------------
 
@@ -1001,9 +1079,10 @@ class MenuController(NSObject):
 
     def openPomodoro_(self, sender):
         # the tracking screen's "Pomodoro" button: jump to whichever of the
-        # focus/break timer is running, starting a fresh one if neither is —
-        # it navigates, it never stops one (that lives on the timer screen's
-        # own "stop" button, so a running break can't be killed by accident).
+        # focus/break timer is running (paused or not), starting a fresh one
+        # if neither is — it navigates, it never stops or resets one (those
+        # live on the timer screen's own buttons, so a running/paused break
+        # can't be killed by accident).
         self._cancel_transition()
         if not self.pomo.running:
             pomodoro.start_work(self.pomo)
@@ -1012,20 +1091,34 @@ class MenuController(NSObject):
         self._screen = "timer"
         self.rebuild()
 
-    def stopPomodoro_(self, sender):
-        was_break = self.pomo.on_break
-        minutes = pomodoro.stop(self.pomo)
-        if was_break:
-            self._flash("break stopped")
+    def pauseResumePomodoro_(self, sender):
+        # the timer screen's "stop"/"continue" toggle: freezes the countdown
+        # in place (still running, just not ticking) rather than ending the
+        # interval — the popover stays on the timer screen either way.
+        if not self.pomo.running:
+            return
+        if self.pomo.paused:
+            pomodoro.resume(self.pomo)
+            self._flash("resumed")
         else:
-            self._flash(f"logged {minutes:.1f} min" if minutes else "stopped")
+            pomodoro.pause(self.pomo)
+            self._flash("paused")
         self._update_status_title()
-        self._cancel_transition()
-        self._screen = "tracking"
         self.rebuild()
 
-    def timerBack_(self, sender):
-        # leave the Pomodoro running; just return to the task list
+    def resetPomodoro_(self, sender):
+        # restart the current phase (focus or break) from its full duration,
+        # discarding progress so far — nothing is logged.
+        if not self.pomo.running:
+            return
+        pomodoro.reset(self.pomo)
+        self._flash("reset")
+        self._update_status_title()
+        self.rebuild()
+
+    def timerMainPage_(self, sender):
+        # leave the Pomodoro running (or paused) and return to the main
+        # tracking screen
         self._screen = "tracking"
         self.rebuild()
 
@@ -1185,20 +1278,25 @@ class MenuController(NSObject):
 
     def openTaskList_(self, sender):
         self._cancel_transition()
-        self._task_list_page = 0
+        # remember where we came from ("tracking" or "timer") so the "‹ back"
+        # button below returns there instead of always going to tracking
+        if self._screen in ("tracking", "timer"):
+            self._tasklist_return_screen = self._screen
+        self._task_list_offset = 0
         self._screen = "tasklist"
         self.rebuild()
 
     def taskListDown_(self, sender):
-        self._task_list_page += 1
+        # upper bound is clamped in _build_tasklist, where the row count is known
+        self._task_list_offset += TASKLIST_SCROLL_STEP
         self.rebuild()
 
     def taskListUp_(self, sender):
-        self._task_list_page = max(0, self._task_list_page - 1)
+        self._task_list_offset = max(0, self._task_list_offset - TASKLIST_SCROLL_STEP)
         self.rebuild()
 
     def taskListBack_(self, sender):
-        self._screen = "tracking"
+        self._screen = self._tasklist_return_screen
         self.rebuild()
 
     def taskListComplete_(self, sender):
@@ -1251,7 +1349,7 @@ class MenuController(NSObject):
         # and refresh each row's leading "#" now that ranks have shifted
         top = self._tasklist_row_top
         step = self._tasklist_row_step
-        start = self._task_list_page * TASKLIST_PAGE_SIZE
+        start = self._task_list_offset
         for i, task_id in enumerate(self._tasklist_row_order):
             view = self._tasklist_row_views.get(task_id)
             if view is None:
@@ -1369,6 +1467,7 @@ class MenuController(NSObject):
                 deadline = self._resolve_deadline()
                 row = tasks.add_task(description, deadline=deadline, manual=1)
                 self._flash(f'added: {row["description"]}')
+                self._label_task_async(row["id"], row["description"])
         except deadlines.DeadlineError as exc:
             self._form_err = exc.message
             self.rebuild()
@@ -1606,7 +1705,10 @@ class MenuController(NSObject):
         button = self.status_item.button()
         if self.pomo.running:
             secs = self.pomo.remaining_seconds()
-            icon = BREAK_ICON if self.pomo.on_break else IDLE_ICON
+            if self.pomo.paused:
+                icon = "⏸"
+            else:
+                icon = BREAK_ICON if self.pomo.on_break else IDLE_ICON
             button.setTitle_(f"{icon} {secs // 60:d}:{secs % 60:02d}")
         else:
             button.setTitle_(IDLE_ICON)
@@ -1655,7 +1757,9 @@ class MenuController(NSObject):
             return f"PRODUCTIVITY\n  db error: {exc}"
         if self.pomo.running:
             secs = self.pomo.remaining_seconds()
-            state = f'{"break" if self.pomo.on_break else "focus"} {secs // 60}:{secs % 60:02d}'
+            phase = "break" if self.pomo.on_break else "focus"
+            paused = "paused " if self.pomo.paused else ""
+            state = f'{paused}{phase} {secs // 60}:{secs % 60:02d}'
         else:
             state = "idle"
         line3 = self._flash_text() or f"● {state}"
@@ -1677,7 +1781,7 @@ class MenuController(NSObject):
         for sub in list(self.view.subviews()):
             sub.removeFromSuperview()
         separators: list[float] = []
-        self._content_w = PANEL_W    # only jobsearch-compact narrows this
+        self._content_w = PANEL_W    # _build_tasklist widens this; nothing else overrides it
         y = PAD
         if self._screen == "form":
             y = self._build_form(y, separators)
@@ -1931,12 +2035,12 @@ class MenuController(NSObject):
                     (cb, base_alpha, rgb), (name_btn, base_alpha, rgb))
                 y += ROW_H + 1
             # final line: how many tasks are still queued behind the visible
-            # ones — click it to open the full "tasks" list window
+            # ones — plain text now; the "Tasks" button below opens the full
+            # list window instead.
             queued = max(0, total - len(rows))
-            self.view.addSubview_(self._button(
+            self.view.addSubview_(self._label(
                 NSMakeRect(PAD, y, PANEL_W - 2 * PAD, ROW_H),
-                f"   {queued} more in queue", "openTaskList:",
-                rgb=_BODY, alpha=GRADIENT[3], hover_rgb=_HEAD))
+                f"   {queued} more in queue", rgb=_BODY, alpha=GRADIENT[3]))
             y += ROW_H
         else:
             self.view.addSubview_(self._label(
@@ -1950,7 +2054,7 @@ class MenuController(NSObject):
 
         half = (PANEL_W - 2 * PAD - 12) / 2
         grid = [
-            ("+ add task", "openForm:"),
+            ("Tasks", "openTaskList:"),
             ("▶ Pomodoro", "openPomodoro:"),
             ("▚ stats", "openStats:"),
             ("⌕ job search", "openJobSearch:"),
@@ -2028,10 +2132,14 @@ class MenuController(NSObject):
 
     @objc.python_method
     def _build_tasklist(self, y, separators):
-        # every open task as a compact table, paged with the up/down arrows
-        # since only a handful of rows fit the popover at once.
+        # every open task as a compact table; only a handful of rows fit the
+        # popover at once, so the up/down arrows slide the visible window by
+        # TASKLIST_SCROLL_STEP rows rather than flipping a full page. Wider
+        # than the other screens (TASKLIST_PANEL_W) to fit the category/
+        # energy columns.
         self._header = None
-        table_w = PANEL_W - 2 * PAD
+        self._content_w = TASKLIST_PANEL_W
+        table_w = self._content_w - 2 * PAD
         rule = "-" * _TABLE_ROW_W
 
         rows: list[dict] = []
@@ -2049,9 +2157,9 @@ class MenuController(NSObject):
         y += 12
 
         total = len(rows)
-        page_count = max(1, (total + TASKLIST_PAGE_SIZE - 1) // TASKLIST_PAGE_SIZE)
-        self._task_list_page = max(0, min(self._task_list_page, page_count - 1))
-        start = self._task_list_page * TASKLIST_PAGE_SIZE
+        max_offset = max(0, total - TASKLIST_PAGE_SIZE)
+        self._task_list_offset = max(0, min(self._task_list_offset, max_offset))
+        start = self._task_list_offset
         page_rows = rows[start:start + TASKLIST_PAGE_SIZE]
 
         self.view.addSubview_(self._label(
@@ -2059,7 +2167,7 @@ class MenuController(NSObject):
         y += 13
         self.view.addSubview_(self._label(
             NSMakeRect(PAD, y, table_w, 16),
-            _table_row("#", "Task", "Deadline", "Repeat"),
+            _table_row("#", "Task", "Deadline", "Repeat", "Category", "Energy"),
             size=11, rgb=_HEAD, alpha=0.85))
         y += 16
         self.view.addSubview_(self._label(
@@ -2088,9 +2196,14 @@ class MenuController(NSObject):
                 task_id = int(task["id"])
                 deadline = task.get("deadline")
                 deadline_s = f"{deadline:%m/%d}" if deadline else "—"
+                # Phase 5: LLM labels — "—" until the background classify
+                # call (app/llm_labels.py) fills them in
+                category_s = task.get("category") or "—"
+                energy_s = task.get("energy") or "—"
                 row = TaskRow.alloc().initWithFrame_(NSMakeRect(PAD, y, row_w, 16))
                 row.configure(self, task_id, task["description"], deadline_s,
-                              _repeat_label(task.get("recurrence")), start + i + 1,
+                              _repeat_label(task.get("recurrence")),
+                              category_s, energy_s, start + i + 1,
                               _BODY, 0.9)
                 self.view.addSubview_(row)
                 self._tasklist_row_order.append(task_id)
@@ -2105,18 +2218,20 @@ class MenuController(NSObject):
         separators.append(y)
         y += 12
 
-        # up/down page arrows, dimmed at either end of the list
-        half = (PANEL_W - 2 * PAD - 12) / 2
+        # up/down arrows slide the window by TASKLIST_SCROLL_STEP rows, dimmed
+        # once the window hits either end of the list
+        half = (table_w - 12) / 2
         self.view.addSubview_(self._button(
             NSMakeRect(PAD, y, half, 20), "▴ up", "taskListUp:",
-            rgb=_BODY, alpha=0.85 if self._task_list_page > 0 else 0.25))
+            rgb=_BODY, alpha=0.85 if start > 0 else 0.25))
         self.view.addSubview_(self._button(
             NSMakeRect(PAD + half + 12, y, half, 20), "▾ down", "taskListDown:",
-            rgb=_BODY, alpha=0.85 if self._task_list_page < page_count - 1 else 0.25))
+            rgb=_BODY, alpha=0.85 if start < max_offset else 0.25))
         y += 24
+        row_range = f"{start + 1}-{start + len(page_rows)}" if page_rows else "0"
         self.view.addSubview_(self._label(
             NSMakeRect(PAD, y, table_w, 12),
-            f"page {self._task_list_page + 1}/{page_count}", size=9,
+            f"{row_range} / {total}", size=9,
             rgb=_BODY, alpha=0.4, align=NSTextAlignmentCenter))
         y += 16
 
@@ -2356,14 +2471,26 @@ class MenuController(NSObject):
         separators.append(y)
         y += 14
         half = (PANEL_W - 2 * PAD - 12) / 2
-        self.view.addSubview_(self._button(
-            NSMakeRect(PAD, y, half, ROW_H),
-            "■ stop break" if on_break else "■ stop", "stopPomodoro:",
-            rgb=_HEAD, alpha=1.0))
-        self.view.addSubview_(self._button(
-            NSMakeRect(PAD + half + 12, y, half, ROW_H), "‹ tasks", "timerBack:",
-            rgb=_BODY, alpha=0.8))
-        return SHEET_H
+        if self.pomo.paused:
+            toggle_label = "▶ continue break" if on_break else "▶ continue"
+        else:
+            toggle_label = "■ stop break" if on_break else "■ stop"
+        # row 1: pause/continue the countdown in place, or restart this phase
+        # from its full duration; row 2: navigate away, timer left as-is
+        grid = [
+            (toggle_label, "pauseResumePomodoro:", _HEAD, 1.0),
+            ("↺ reset", "resetPomodoro:", _BODY, 0.8),
+            ("Tasks", "openTaskList:", _BODY, 0.8),
+            ("⌂ main page", "timerMainPage:", _BODY, 0.8),
+        ]
+        for i, (text, action, rgb, alpha) in enumerate(grid):
+            col = i % 2
+            x = PAD + col * (half + 12)
+            self.view.addSubview_(self._button(
+                NSMakeRect(x, y, half, ROW_H), text, action, rgb=rgb, alpha=alpha))
+            if col == 1:
+                y += ROW_H + 6
+        return max(SHEET_H, y + PAD - 6)
 
     @objc.python_method
     def _build_settings(self, y, separators):

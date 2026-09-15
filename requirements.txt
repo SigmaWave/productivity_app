@@ -1,3 +1,4 @@
 psycopg[binary]>=3.2
 python-dotenv>=1.0
 pyobjc-framework-Cocoa>=10.0
+ollama>=0.6

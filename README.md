@@ -2,7 +2,7 @@
 Productivity app that tracks and automatically assigns tasks based on LLM judgment. Work in Pomodoro session, tracking of tasks remaining and optimization of energy level throughout the day to adapt the tasks being done.
 
 
-## Phases - Current: 5
+## Phases - Current: 7
 
 ### Phase 1: Set up Postgres Database ✅
 `compose.yaml` + `init.sql` bring up Postgres 18 as `productivity_db`. The schema
@@ -29,10 +29,13 @@ list moves up; clicking the name instead pins that task as the active one
 (`tasks.pinned_at`, `migrations/005_task_pin.sql`), replacing whichever task was
 pinned before it. Finishing a Pomodoro logs a `session` row. The "N more in
 queue" line opens a **tasks list** window — every open task as a
-`# | Task | Deadline | Repeat` table, paged 6 at a time with `▴`/`▾`. Press and
-drag a row to reorder it; the new order is written to `tasks.sort_order`
-(`migrations/006_task_sort_order.sql`) and, once anything has been dragged,
-takes precedence over the computed priority score everywhere tasks are shown.
+`# | Task | Deadline | Repeat | Category | Energy` table (the last two columns
+are the Phase 5 LLM labels — `—` until Ollama classifies the task; the window
+is a little wider than the other screens to fit them), paged 6 at a time with
+`▴`/`▾`. Press and drag a row to reorder it; the new order is written to
+`tasks.sort_order` (`migrations/006_task_sort_order.sql`) and, once anything
+has been dragged, takes precedence over the computed priority score
+everywhere tasks are shown.
 
 ### Phase 2.3: Set up icon on task bar ✅
 🍅 tomato icon in the menu bar; switches to a live `MM:SS` countdown (☕ on
@@ -57,7 +60,21 @@ concrete task for every template that is due and hasn't fired yet today.
 Multi-day rules like `weekly:0,3` and `monthly` are still supported by
 `recurring.add_recurring()` directly.
 
-### Phase 5: Implement LLM call with Ollama
+### Phase 5: Implement LLM call with Ollama ✅
+`app/llm_labels.py` calls a local Ollama server (`qwen2.5:14b`) with the
+prompts in `prompts/` to assign each task a `category` (how it's actually
+performed — device + mental posture, e.g. `deep_computer`, `mail`,
+`physical_out`) and an `energy` level (`low` / `medium` / `high` cognitive
+load). The call runs in a background thread so it never blocks the UI: once
+for a task right after it's created (manual add or a recurring task
+materialising), and as a startup sweep over every task that doesn't have both
+labels yet (`app/llm_labels.label_unlabeled_tasks`). A failed or unreachable
+Ollama server leaves the columns NULL, which is exactly what marks a task as
+still needing the sweep — nothing here can block or fail task creation. The
+tasks list window (see Phase 2.2) shows both columns and is sized wider than
+the other screens to fit them; open the window before Ollama finishes and the
+row fills in live once the background call returns.
+Existing DBs: apply `migrations/010_task_labels.sql`.
 
 ### Phase 6: Speed typing tracking ✅
 `app/keys.py` — a global `NSEvent` monitor timestamps **every key press anywhere
@@ -110,6 +127,13 @@ for f in migrations/*.sql; do docker compose exec -T db psql -U postgres -d prod
 Connection settings live in `.env` (`POSTGRES_PASSWORD`, `PGHOST`, `PGPORT`,
 `PGDATABASE`, `PGUSER`). Optional demo data:
 `.venv/bin/python -m scripts.seed_demo --wipe`
+
+Phase 5's task labeling needs a local [Ollama](https://ollama.com) server
+running with the `qwen2.5:14b` model pulled (`ollama pull qwen2.5:14b`); the
+app talks to it at `http://localhost:11434` by default — override with
+`OLLAMA_HOST` / `OLLAMA_MODEL` in `.env` if yours runs elsewhere. If it's
+unreachable, tasks just keep their `category` / `energy` columns NULL and
+get picked up on the next launch — nothing else in the app depends on it.
 
 ### The pop-up panel
 Toggle it with the 🍅 or **Ctrl+Shift+Space** (works from any app — Carbon
@@ -241,6 +265,8 @@ rows = show_tasks("open")   # prints a table, also returns list[dict]
 | `recurring_id` | FK to `recurring_tasks.id` when this task was auto-generated |
 | `estimated_duration` | `float` Estimated duration (minutes)|
 | `manual`| `0` (automatically added) / `1` (manually added) |
+| `category` | `str` LLM-assigned label for how the task is performed (`mail`, `deep_computer`, … — see `prompts/label.txt`); NULL until classified |
+| `energy` | `str` LLM-assigned cognitive load — `low` / `medium` / `high` (see `prompts/energy.txt`); NULL until classified |
 
 ---
 

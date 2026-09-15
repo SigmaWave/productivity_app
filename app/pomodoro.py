@@ -20,14 +20,21 @@ class PomodoroState:
     started_monotonic: float = 0.0
     ends_monotonic: float = 0.0
     started_at: datetime | None = None
+    # paused: the countdown is frozen at remaining_at_pause seconds (still
+    # "running" — status bar/timer screen stay live, just not ticking down)
+    paused: bool = False
+    remaining_at_pause: float = 0.0
+    paused_at_monotonic: float = 0.0
 
     def remaining_seconds(self) -> int:
         if not self.running:
             return 0
+        if self.paused:
+            return max(0, int(round(self.remaining_at_pause)))
         return max(0, int(round(self.ends_monotonic - time.monotonic())))
 
     def is_finished(self) -> bool:
-        return self.running and time.monotonic() >= self.ends_monotonic
+        return self.running and not self.paused and time.monotonic() >= self.ends_monotonic
 
 
 def start_work(state: PomodoroState) -> PomodoroState:
@@ -35,6 +42,7 @@ def start_work(state: PomodoroState) -> PomodoroState:
     work_min, _ = config.pomodoro_durations()
     state.running = True
     state.on_break = False
+    state.paused = False
     state.started_monotonic = now
     state.ends_monotonic = now + work_min * 60
     state.started_at = datetime.now(timezone.utc)
@@ -46,9 +54,40 @@ def start_break(state: PomodoroState) -> PomodoroState:
     _, break_min = config.pomodoro_durations()
     state.running = True
     state.on_break = True
+    state.paused = False
     state.started_monotonic = now
     state.ends_monotonic = now + break_min * 60
     state.started_at = None
+    return state
+
+
+def reset(state: PomodoroState) -> PomodoroState:
+    """Restart the current phase (work or break) from its full duration,
+    discarding progress made so far without logging it."""
+    if not state.running:
+        return state
+    return start_break(state) if state.on_break else start_work(state)
+
+
+def pause(state: PomodoroState) -> PomodoroState:
+    """Freeze the countdown in place. A no-op if not running or already
+    paused."""
+    if state.running and not state.paused:
+        state.remaining_at_pause = max(0.0, state.ends_monotonic - time.monotonic())
+        state.paused_at_monotonic = time.monotonic()
+        state.paused = True
+    return state
+
+
+def resume(state: PomodoroState) -> PomodoroState:
+    """Pick the countdown back up where pause() froze it. started_monotonic
+    is shifted forward by the paused duration so an eventual stop() still
+    logs only the time actually spent running."""
+    if state.running and state.paused:
+        now = time.monotonic()
+        state.started_monotonic += now - state.paused_at_monotonic
+        state.ends_monotonic = now + state.remaining_at_pause
+        state.paused = False
     return state
 
 
@@ -64,6 +103,7 @@ def stop(state: PomodoroState, *, log: bool = True) -> float:
             _log_session(state.started_at, elapsed_min)
     state.running = False
     state.on_break = False
+    state.paused = False
     state.started_at = None
     return elapsed_min
 

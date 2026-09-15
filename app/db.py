@@ -3,10 +3,17 @@
 A single lazily-created psycopg connection is reused for the life of the
 process. Every public helper opens its own cursor and commits, so callers just
 get plain Python values back and never have to think about transactions.
+
+A psycopg connection isn't safe for concurrent use from multiple threads, so
+``cursor()`` serializes access through ``_lock`` — this app is single-threaded
+except for the background LLM-labeling calls in app/llm_labels.py (kicked off
+from app/menubar.py), and the lock is what lets those touch the database
+without racing the main thread's own queries.
 """
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -16,6 +23,7 @@ from psycopg.rows import dict_row
 from .config import db_connection_kwargs
 
 _conn: psycopg.Connection | None = None
+_lock = threading.Lock()
 
 
 def get_connection() -> psycopg.Connection:
@@ -35,18 +43,20 @@ def close_connection() -> None:
 
 @contextmanager
 def cursor(*, commit: bool = True) -> Iterator[psycopg.Cursor]:
-    """Dict-row cursor context manager with commit/rollback handling."""
-    conn = get_connection()
-    cur = conn.cursor(row_factory=dict_row)
-    try:
-        yield cur
-        if commit:
-            conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cur.close()
+    """Dict-row cursor context manager with commit/rollback handling.
+    Holds ``_lock`` for its duration — see the module docstring."""
+    with _lock:
+        conn = get_connection()
+        cur = conn.cursor(row_factory=dict_row)
+        try:
+            yield cur
+            if commit:
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
 
 
 def query(sql: str, params: tuple | dict | None = None) -> list[dict[str, Any]]:

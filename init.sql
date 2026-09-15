@@ -20,7 +20,16 @@ CREATE TABLE tasks (
     pinned_at TIMESTAMPTZ,
     -- manual drag-to-reorder position from the tasks list window, spaced
     -- 10 apart; NULL until the user has dragged anything (see reorder_tasks)
-    sort_order INTEGER
+    sort_order INTEGER,
+    -- Phase 5: LLM-assigned labels (app/llm_labels.py, via a local Ollama
+    -- model). NULL until a successful classification — that's how the
+    -- startup sweep finds tasks still needing one.
+    category TEXT CHECK (category IN (
+        'job', 'mail', 'message', 'call', 'linkedin', 'deep_computer', 'deep_offline',
+        'admin_desk', 'admin_mobile', 'read_desk', 'read_mobile',
+        'physical_home', 'physical_out', 'unknown'
+    )),
+    energy TEXT CHECK (energy IN ('low', 'medium', 'high'))
 );
 
 CREATE TABLE session (
