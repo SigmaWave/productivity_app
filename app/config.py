@@ -24,6 +24,26 @@ def _get(name: str, default: str) -> str:
     return value if value not in (None, "") else default
 
 
+def _local_timezone_name() -> str:
+    """The host's IANA timezone name (e.g. "America/New_York"), read from the
+    ``/etc/localtime`` symlink macOS/Linux keep pointed at it.
+
+    The Postgres container defaults its session TimeZone to UTC, which is
+    almost never this host's zone. Left alone, that mismatch silently shifts
+    every "today" boundary — ``CURRENT_DATE``, ``deadline::date``, a
+    ``TIMESTAMPTZ`` handed back to Python — by the UTC offset: a task deadline
+    of "end of day" (23:59 local) stored as 03:59 UTC the next day, checked
+    against a UTC ``CURRENT_DATE`` that's already rolled over. That's what
+    made the calendar's day view report "no deadlines today" for a task due
+    today. Falls back to "UTC" if the symlink can't be resolved.
+    """
+    try:
+        real = os.path.realpath("/etc/localtime")
+        return real.split("zoneinfo/", 1)[1]
+    except (OSError, IndexError):
+        return "UTC"
+
+
 def db_connection_kwargs() -> dict[str, str | int]:
     """psycopg.connect(**kwargs) arguments for the productivity database."""
     return {
@@ -32,6 +52,9 @@ def db_connection_kwargs() -> dict[str, str | int]:
         "dbname": _get("PGDATABASE", "productivity_db"),
         "user": _get("PGUSER", "postgres"),
         "password": _get("POSTGRES_PASSWORD", "postgres"),
+        # pin the session's TimeZone to the host's own, not Postgres's UTC
+        # default — see _local_timezone_name(). PGTZ overrides if ever needed.
+        "options": f"-c TimeZone={_get('PGTZ', _local_timezone_name())}",
     }
 
 

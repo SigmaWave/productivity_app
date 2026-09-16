@@ -164,3 +164,13 @@ def complete_task(task_id: int) -> dict[str, Any] | None:
 
 def delete_task(task_id: int) -> None:
     db.execute("DELETE FROM tasks WHERE id = %s", (task_id,))
+
+
+def clear_open_tasks() -> int:
+    """Delete every open task — clears the day's schedule. Only deletes rows
+    in ``tasks``, never ``recurring_tasks``, so a repeating task's template
+    survives and simply spawns a fresh instance next time it's due. Returns
+    the number of tasks removed."""
+    with db.cursor() as cur:
+        cur.execute("DELETE FROM tasks WHERE done < 1")
+        return cur.rowcount

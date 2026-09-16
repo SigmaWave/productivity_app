@@ -1,0 +1,17 @@
+{
+  "_comment": "category -> energy level. Replaces the old per-task Ollama energy call (see utils/label.txt) with a static lookup keyed on the category Ollama already assigns. Every communication-mechanism category (mail, message, call, linkedin) is low by policy. The rest follow the same reasoning the old energy prompt used per category: deep_computer/deep_offline are high (sustained generative work); admin_desk/admin_mobile, read_mobile, physical_home/physical_out are low (rote, passive, or physical-only); read_desk and the ambiguous job/unknown buckets are medium.",
+  "job": "medium",
+  "mail": "low",
+  "message": "low",
+  "call": "low",
+  "linkedin": "low",
+  "deep_computer": "high",
+  "deep_offline": "high",
+  "admin_desk": "low",
+  "admin_mobile": "low",
+  "read_desk": "medium",
+  "read_mobile": "low",
+  "physical_home": "low",
+  "physical_out": "low",
+  "unknown": "medium"
+}

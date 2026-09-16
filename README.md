@@ -29,10 +29,11 @@ list moves up; clicking the name instead pins that task as the active one
 (`tasks.pinned_at`, `migrations/005_task_pin.sql`), replacing whichever task was
 pinned before it. Finishing a Pomodoro logs a `session` row. The "N more in
 queue" line opens a **tasks list** window — every open task as a
-`# | Task | Deadline | Repeat | Category | Energy` table (the last two columns
+`# | Task | Deadline | Category | Energy` table (the last two columns
 are the Phase 5 LLM labels — `—` until Ollama classifies the task; the window
-is a little wider than the other screens to fit them), paged 6 at a time with
-`▴`/`▾`. Press and drag a row to reorder it; the new order is written to
+is a little wider than the other screens to fit them), every open task shown
+at once — the window grows to fit the list. Press and drag a row to reorder
+it; the new order is written to
 `tasks.sort_order` (`migrations/006_task_sort_order.sql`) and, once anything
 has been dragged, takes precedence over the computed priority score
 everywhere tasks are shown.
@@ -62,14 +63,20 @@ Multi-day rules like `weekly:0,3` and `monthly` are still supported by
 
 ### Phase 5: Implement LLM call with Ollama ✅
 `app/llm_labels.py` calls a local Ollama server (`qwen2.5:14b`) with the
-prompts in `prompts/` to assign each task a `category` (how it's actually
-performed — device + mental posture, e.g. `deep_computer`, `mail`,
-`physical_out`) and an `energy` level (`low` / `medium` / `high` cognitive
-load). The call runs in a background thread so it never blocks the UI: once
-for a task right after it's created (manual add or a recurring task
-materialising), and as a startup sweep over every task that doesn't have both
-labels yet (`app/llm_labels.label_unlabeled_tasks`). A failed or unreachable
-Ollama server leaves the columns NULL, which is exactly what marks a task as
+prompt in `utils/label.txt` to assign each task a `category` (how it's
+actually performed — device + mental posture, e.g. `deep_computer`, `mail`,
+`physical_out`). `energy` (`low` / `medium` / `high` cognitive load) is no
+longer a second Ollama call — it's a static lookup from `category` via
+`utils/energy_map.json` (`app/llm_labels.energy_for_category`), since the
+same category always carries the same load. Every communication category
+(`mail`, `message`, `call`, `linkedin`) is `low`; `deep_computer`/
+`deep_offline` are `high`; the rest are `low` or `medium` by the same
+reasoning the original per-task energy prompt used. The category call runs
+in a background thread so it never blocks the UI: once for a task right
+after it's created (manual add or a recurring task materialising), and as a
+startup sweep over every task that doesn't have both labels yet
+(`app/llm_labels.label_unlabeled_tasks`). A failed or unreachable Ollama
+server leaves both columns NULL, which is exactly what marks a task as
 still needing the sweep — nothing here can block or fail task creation. The
 tasks list window (see Phase 2.2) shows both columns and is sized wider than
 the other screens to fit them; open the window before Ollama finishes and the
@@ -105,8 +112,29 @@ instead of dismissing it; clicking that banner expands it back. `‹ back` is
 the only way to actually leave. The stats screen's `jobs` button opens a paged
 `id | started | finished | taken` table of every logged application (all
 time, not just today).
+Next to it, a second **linkedin outreach today** counter (same `-`/`+` shape,
+its own column) logs to `linkedin_outreach` — a plain per-day tally with no
+stopwatch tie, for connection requests / InMails / comments rather than
+timed applications.
 Existing DBs: apply `migrations/007_job_applications.sql`,
-`migrations/008_job_started_at.sql`, and `migrations/009_job_elapsed_seconds.sql`.
+`migrations/008_job_started_at.sql`, `migrations/009_job_elapsed_seconds.sql`,
+and `migrations/012_linkedin_outreach.sql`.
+
+### Mouse Tracking (ad-hoc — not one of the numbered phases above)
+`app/mouse.py` — a global `NSEvent` monitor, mirroring Phase 6's keystroke
+tracker. Every mouse-down anywhere on the machine is logged as a `click` row
+(with which button); movement is sampled at most once every 100 ms as a
+`move` row rather than on every raw event, since mouse-moved events fire far
+more often than keystrokes and would otherwise flood the table. Both are
+held in RAM and bulk-inserted into the `mouse_event` table every 60 s,
+printing `database updated (N mouse events)`. Needs the same macOS
+**Accessibility** permission as Phase 6 — until granted the monitors see
+nothing and the app says so. The stats screen's legend gets a third entry,
+**mouse**, alongside `cpm`/`diff`: rather than a bar chart, it's a spatial
+scatter of recorded positions plotted against the main screen's resolution —
+dim dots for movement samples, bright dots for clicks — over the same
+look-back window as the other two metrics.
+Existing DBs: apply `migrations/013_mouse_event.sql`.
 
 ---
 
@@ -125,7 +153,14 @@ for f in migrations/*.sql; do docker compose exec -T db psql -U postgres -d prod
 ```
 
 Connection settings live in `.env` (`POSTGRES_PASSWORD`, `PGHOST`, `PGPORT`,
-`PGDATABASE`, `PGUSER`). Optional demo data:
+`PGDATABASE`, `PGUSER`). Every connection also pins the Postgres session's
+`TimeZone` to the host's own (read from `/etc/localtime`, override with
+`PGTZ`) rather than leaving it at the container's UTC default — otherwise
+`CURRENT_DATE`, `deadline::date`, and every `TIMESTAMPTZ` read back from
+Python silently drift by the UTC offset (an "end of day" deadline stored as
+tomorrow's early hours in UTC, evening Pomodoro sessions or job applications
+filed under the wrong day, the calendar's day view missing today's tasks
+entirely). See `app/config.py:_local_timezone_name`. Optional demo data:
 `.venv/bin/python -m scripts.seed_demo --wipe`
 
 Phase 5's task labeling needs a local [Ollama](https://ollama.com) server
@@ -207,6 +242,10 @@ restart the app. (All hand-editable config JSON lives in `config/`.)
     `750+`) — never folded into a real bin. The **`›` button at the chart's
     top-right** widens the bound by 250 ms per click and redraws live, wrapping
     back to 750 ms after 3 s
+  - **mouse** — a spatial scatter of recorded mouse positions over the same
+    window, plotted against the main screen's resolution instead of a bar
+    chart: dim dots for movement samples (throttled to one per 100 ms),
+    bright dots for clicks — see Mouse Tracking above
 - `jobs` (below the metric legend) opens the jobs table — see Job Search above
 - `‹ back` returns to the tracking screen
 
@@ -222,6 +261,7 @@ table and also returns the rows (`list[dict]`).
 .venv/bin/python -m scripts.db_helpers sessions --days 14
 .venv/bin/python -m scripts.db_helpers keystrokes --minutes 60  # per-min counts by kind
 .venv/bin/python -m scripts.db_helpers speed --minutes 60       # cpm + inter-key gaps
+.venv/bin/python -m scripts.db_helpers mouse --minutes 60       # per-min move/click counts
 .venv/bin/python -m scripts.db_helpers deadlines --days 7
 .venv/bin/python -m scripts.db_helpers done --days 7       # recent completions
 .venv/bin/python -m scripts.db_helpers stats               # task + session aggregates
@@ -265,8 +305,8 @@ rows = show_tasks("open")   # prints a table, also returns list[dict]
 | `recurring_id` | FK to `recurring_tasks.id` when this task was auto-generated |
 | `estimated_duration` | `float` Estimated duration (minutes)|
 | `manual`| `0` (automatically added) / `1` (manually added) |
-| `category` | `str` LLM-assigned label for how the task is performed (`mail`, `deep_computer`, … — see `prompts/label.txt`); NULL until classified |
-| `energy` | `str` LLM-assigned cognitive load — `low` / `medium` / `high` (see `prompts/energy.txt`); NULL until classified |
+| `category` | `str` LLM-assigned label for how the task is performed (`mail`, `deep_computer`, … — see `utils/label.txt`); NULL until classified |
+| `energy` | `str` Cognitive load — `low` / `medium` / `high` — looked up from `category` via `utils/energy_map.json`, not a separate LLM call; NULL until `category` is classified |
 
 ---
 
@@ -298,6 +338,16 @@ rows = show_tasks("open")   # prints a table, also returns list[dict]
 | `id` | `bigserial` |
 | `ts` | `timestamptz` when the key was pressed |
 | `kind` | `char` \| `delete` \| `other` |
+
+### Mouse Event
+
+| Field | Description |
+| :--- | :--- |
+| `id` | `bigserial` |
+| `ts` | `timestamptz` when the sample/click was recorded |
+| `kind` | `move` \| `click` |
+| `x`, `y` | `int` screen coordinates (`NSEvent.mouseLocation()`, bottom-left origin) |
+| `button` | `left` \| `right` \| `other`; `NULL` for `move` rows |
 
 ### Schedule
 

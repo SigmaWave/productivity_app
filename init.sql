@@ -108,3 +108,17 @@ CREATE TABLE job_applications (
     timer_seconds REAL,
     diff_seconds REAL
 );
+
+-- Mouse activity stream: movement samples (throttled, not every raw event)
+-- plus every click, buffered in RAM and bulk-inserted every 60s (app/mouse.py),
+-- mirroring the keystroke table above. x/y are screen coordinates from
+-- NSEvent.mouseLocation() (bottom-left origin); button is NULL for 'move' rows.
+CREATE TABLE mouse_event (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('move', 'click')),
+    x INTEGER NOT NULL,
+    y INTEGER NOT NULL,
+    button TEXT CHECK (button IN ('left', 'right', 'other'))
+);
+CREATE INDEX mouse_event_ts_idx ON mouse_event (ts);

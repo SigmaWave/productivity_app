@@ -16,6 +16,7 @@ Use as a library::
     python -m scripts.db_helpers sessions --days 14
     python -m scripts.db_helpers typing
     python -m scripts.db_helpers deadlines
+    python -m scripts.db_helpers mouse --minutes 60
     python -m scripts.db_helpers stats
     python -m scripts.db_helpers sql "SELECT * FROM tasks WHERE urgent > 0.7"
 
@@ -95,6 +96,8 @@ def overview() -> Rows:
         UNION ALL SELECT 'schedule',       COUNT(*) FROM schedule
         UNION ALL SELECT 'keystroke',      COUNT(*) FROM keystroke
         UNION ALL SELECT 'keystroke (1h)', COUNT(*) FROM keystroke WHERE ts >= now() - interval '1 hour'
+        UNION ALL SELECT 'mouse_event',      COUNT(*) FROM mouse_event
+        UNION ALL SELECT 'mouse_event (1h)', COUNT(*) FROM mouse_event WHERE ts >= now() - interval '1 hour'
         """
     )
     print_table(rows, title="Overview", columns=["table", "rows"])
@@ -182,6 +185,25 @@ def show_keystrokes(minutes: int = 60) -> Rows:
         (minutes,),
     )
     print_table(rows, title=f"Keystrokes per minute (last {minutes} min)")
+    return rows
+
+
+def show_mouse(minutes: int = 60) -> Rows:
+    """Per-minute mouse move/click counts over the last `minutes` minutes."""
+    rows = db.query(
+        """
+        SELECT date_trunc('minute', ts) AS minute,
+               COUNT(*) FILTER (WHERE kind = 'move')  AS moves,
+               COUNT(*) FILTER (WHERE kind = 'click') AS clicks,
+               COUNT(*)                               AS total
+        FROM mouse_event
+        WHERE ts >= now() - make_interval(mins => %s)
+        GROUP BY minute
+        ORDER BY minute DESC
+        """,
+        (minutes,),
+    )
+    print_table(rows, title=f"Mouse activity per minute (last {minutes} min)")
     return rows
 
 
@@ -342,6 +364,9 @@ def _build_parser() -> argparse.ArgumentParser:
     ks = sub.add_parser("keystrokes", help="per-minute keystroke counts by kind")
     ks.add_argument("--minutes", type=int, default=60)
 
+    mo = sub.add_parser("mouse", help="per-minute mouse move/click counts")
+    mo.add_argument("--minutes", type=int, default=60)
+
     tsp = sub.add_parser("speed", help="cpm + inter-key gap stats")
     tsp.add_argument("--minutes", type=int, default=60)
 
@@ -379,6 +404,8 @@ def main(argv: list[str] | None = None) -> int:
             show_typing(args.days)
         case "keystrokes":
             show_keystrokes(args.minutes)
+        case "mouse":
+            show_mouse(args.minutes)
         case "speed":
             typing_speed(args.minutes)
         case "schema":

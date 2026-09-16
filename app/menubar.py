@@ -33,15 +33,39 @@ Screens (``self._screen``):
   deletes excluded, with a trailing rolling-average line — window set by the
   top-right ``5``/``10``/``20`` buttons — and y-gridlines every 50; x-axis is
   absolute clock time counting back over the window —
-  30-min ticks ≤2h, 1-h ticks above) and ``diff`` (a histogram of the ms gap
+  30-min ticks ≤2h, 1-h ticks above), ``diff`` (a histogram of the ms gap
   between consecutive keystrokes, everything counted — x-axis is gap duration,
   not clock time, fixed 50 ms bins up to a cap the top-right ``›`` widens by
-  250 ms a click). A
+  250 ms a click), and ``mouse`` (a spatial scatter of recorded positions —
+  dim dots for movement samples, bright dots for clicks — plotted against the
+  main screen's resolution rather than a bar chart, since position is the
+  point). A
   bottom-right selector (``1h``/``2h``/``6h``/``12h``) sets the look-back
-  window for both; it starts at ``keys.STATS_WINDOW_MINUTES``.
+  window for all three; it starts at ``keys.STATS_WINDOW_MINUTES``.
+* **calendar** — opened from the ``Calendar`` button: an hour-by-hour day
+  timeline by default, a fixed ``09:00``-``24:00`` grid every day, always
+  drawn even with nothing on it (``DayTimelineView`` — gridlines down the
+  left, tasks as colored blocks, overlapping ones split side by side rather
+  than stacked on top of each other, a red current-time line when today is
+  shown). A task with a real scheduled time (its deadline's time-of-day isn't
+  the ``23:59``/``00:00`` day-boundary marker) spans
+  ``[deadline - estimated_duration, deadline]``; everything else — a
+  day-boundary-only deadline, or (today only) no deadline at all — gets a
+  stable, per-task random slot instead (labelled ``~HH:MM`` rather than a
+  real time), on its deadline's day if it has one or today after the current
+  moment if it doesn't, since nothing says where it actually belongs. A
+  ``day``/``week`` toggle switches to the same fixed hour grid laid out as 7
+  day columns side by side (``WeekTimelineView`` — Monday through Sunday,
+  each day's blocks confined to its own column, current-time line only
+  across today's), narrower and untitled since there isn't room for the day
+  view's per-block time label; ``‹``/``›`` slide the shown day or week
+  by one unit and ``today`` jumps back to the current one. iCal / Google
+  Calendar sync is a later phase — for now it only surfaces this app's own
+  task deadlines.
 
 Phase 6: every keystroke on the machine is timestamped in RAM and flushed to the
-``keystroke`` table every 60 s (``app/keys.py``).
+``keystroke`` table every 60 s (``app/keys.py``). Mouse movement (throttled) and
+every click are tracked the same way into ``mouse_event`` (``app/mouse.py``).
 """
 
 from __future__ import annotations
@@ -74,6 +98,7 @@ from AppKit import (
     NSPopUpButton,
     NSRunLoop,
     NSRunLoopCommonModes,
+    NSScreen,
     NSStatusBar,
     NSTextAlignmentCenter,
     NSTextAlignmentLeft,
@@ -88,7 +113,19 @@ from AppKit import (
 from Foundation import NSMakeRange, NSObject
 from PyObjCTools import AppHelper
 
-from . import config, db, deadlines, jobsearch, keys, llm_labels, pomodoro, recurring, tasks
+from . import (
+    calendar_view,
+    config,
+    db,
+    deadlines,
+    jobsearch,
+    keys,
+    llm_labels,
+    mouse,
+    pomodoro,
+    recurring,
+    tasks,
+)
 
 try:
     from .hotkey import CONTROL as _HK_CONTROL, SHIFT as _HK_SHIFT, GlobalHotKey
@@ -151,18 +188,14 @@ _CPM_MA_CHOICES = (5, 10, 20)
 # seconds of digital rain shown when loading a sub-screen (the base transition)
 TRANSITION_SECONDS = 1.0
 
-# how often the RAM keystroke buffer is written to Postgres
+# how often the RAM keystroke / mouse-event buffers are written to Postgres
 KEYSTROKE_FLUSH_SECONDS = 60
+MOUSE_FLUSH_SECONDS = 60
 
 # checking a task off: how long it stands still showing [X] before fading,
 # and how long the fade itself takes, before the row is actually removed
 TASK_CHECK_STAND_S = 0.5
 TASK_CHECK_FADE_S = 2.0
-
-# full task-list window: tasks shown at once, and how many rows the up/down
-# arrows slide the visible window by (a partial overlap, not a hard page flip)
-TASKLIST_PAGE_SIZE = 6
-TASKLIST_SCROLL_STEP = 3
 
 # the tasks-list window is wider than every other screen (PANEL_W) to fit the
 # Phase 5 category/energy columns alongside the existing ones
@@ -170,6 +203,51 @@ TASKLIST_PANEL_W = PANEL_W + 190
 
 # jobs table (stats screen): applications shown per page
 JOBTABLE_PAGE_SIZE = 6
+
+# calendar day view: an hour-by-hour timeline (app/menubar.py DayTimelineView)
+# rather than a plain list — tasks become blocks spanning
+# [deadline - estimated_duration, deadline], since a task only carries a due
+# time, not a real start/end (that arrives with the later iCal/Google sync).
+# Fixed for every day, never resized to fit whatever's scheduled.
+CAL_DAY_START_HOUR = 9
+CAL_DAY_END_HOUR = 24      # clamped to [0, 24]
+CAL_DEFAULT_BLOCK_MIN = 30  # block length for a task with no estimated_duration
+CAL_HOUR_PX = 26            # pixels per hour row (day view)
+CAL_GUTTER = 44             # left column width reserved for hour labels (day view)
+
+# calendar week view: the same fixed hour grid as the day view, but as 7 day
+# columns side by side (WeekTimelineView) rather than one line of truncated
+# names per day. Shorter per-hour pixel height and gutter than the day view —
+# with 7 columns sharing the width there's no room for the day view's detail,
+# so it's read as a week-at-a-glance rather than a precise schedule.
+CAL_WEEK_HOUR_PX = 15
+CAL_WEEK_GUTTER = 26
+CAL_WEEK_HEADER_H = 14      # weekday-name row above the hour grid
+# the week grid needs more horizontal room for 7 columns than the other
+# screens (PANEL_W) — same idea as TASKLIST_PANEL_W widening for its columns
+CALENDAR_WEEK_PANEL_W = PANEL_W + 140
+
+# calendar event-block colors, keyed by the task's LLM category label
+# (app/llm_labels.CATEGORIES) so same-category tasks read as the same
+# "calendar" — a stand-in for the per-source colors a real iCal/Google sync
+# will eventually provide
+_CAL_PALETTE = (
+    (0.20, 0.60, 0.65),   # teal
+    (0.25, 0.45, 0.90),   # blue
+    (0.85, 0.30, 0.45),   # red / pink
+    (0.55, 0.35, 0.85),   # purple
+    (0.85, 0.60, 0.20),   # amber
+    (0.30, 0.70, 0.40),   # green
+)
+_CAL_CATEGORY_COLOR = {
+    "job": _CAL_PALETTE[1], "linkedin": _CAL_PALETTE[1],
+    "mail": _CAL_PALETTE[0], "message": _CAL_PALETTE[0],
+    "read_desk": _CAL_PALETTE[0], "read_mobile": _CAL_PALETTE[0],
+    "call": _CAL_PALETTE[4],
+    "deep_computer": _CAL_PALETTE[3], "deep_offline": _CAL_PALETTE[3],
+    "admin_desk": _CAL_PALETTE[5], "admin_mobile": _CAL_PALETTE[5],
+    "physical_home": _CAL_PALETTE[2], "physical_out": _CAL_PALETTE[2],
+}
 
 # active task + next two visible, then the "in queue" line, all fading down a
 # luminosity gradient (GRADIENT[3] is the queue line, kept from when a 4th task
@@ -192,11 +270,6 @@ _REPEAT_RULES = {
     "Sundays": "weekly:6",
 }
 _TIME_ITEMS = ("—", *(f"{h:02d}:00" for h in range(7, 23)))
-
-# recurrence rule -> the same short label the add-task form's dropdown used
-# for it (falls back to the raw rule for ones the form can't produce, like
-# "weekly" or "monthly" from recurring.add_recurring() called directly)
-_REPEAT_LABELS = {rule: label for label, rule in _REPEAT_RULES.items() if rule}
 
 
 # --------------------------------------------------------------------------
@@ -223,36 +296,158 @@ def _checkbox_glyph(checked: bool) -> str:
     return "[X]" if checked else "[ ]"
 
 
-def _repeat_label(recurrence: str | None) -> str:
-    if not recurrence:
-        return "once"
-    return _REPEAT_LABELS.get(recurrence, recurrence)
-
-
 def _elide(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _fmt_clock(dt) -> str:
+    """``9:05`` / ``11`` — no AM/PM, used inside a time range that carries
+    its own suffix, and for the current-time indicator."""
+    h = dt.hour % 12 or 12
+    return f"{h}:{dt.minute:02d}" if dt.minute else str(h)
+
+
+def _time_range_label(start_dt, end_dt) -> str:
+    period = "AM" if end_dt.hour < 12 else "PM"
+    return f"{_fmt_clock(start_dt)}–{_fmt_clock(end_dt)}{period}"
+
+
+def _hour_label(hour: int) -> str:
+    hour %= 24
+    period = "AM" if hour < 12 else "PM"
+    return f"{hour % 12 or 12} {period}"
+
+
+def _naive(dt):
+    """Strip tzinfo from a fetched ``timestamptz`` value — Postgres already
+    converts it to the session's local wall-clock time on the way out, so the
+    fields are already local; this just makes it safe to mix with a plain
+    ``datetime.now()`` in arithmetic without a naive/aware TypeError."""
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
+def _layout_columns(spans):
+    """Assign each ``(start, end, task)`` span a side-by-side column so
+    overlapping tasks in the day timeline sit next to each other instead of
+    stacking on top of one another. Returns parallel ``(col, cols)`` lists —
+    ``col`` is the span's 0-based column index, ``cols`` the total number of
+    columns in its overlap cluster (spans that don't overlap anything get
+    ``col=0, cols=1``, i.e. full width).
+
+    Standard calendar-view sweep: walk spans in start order, track each open
+    column's current end time, and drop a span into the first column that's
+    already free (its previous occupant ended by this span's start) or open a
+    new one. A run of spans connected end-to-end by overlap forms one
+    cluster, sized by the most columns any single moment in it needed."""
+    order = sorted(range(len(spans)), key=lambda i: spans[i][0])
+    col_of = [0] * len(spans)
+    cluster_of = [0] * len(spans)
+    cluster_cols = []
+
+    col_ends: list = []          # end time currently occupying each column
+    cluster_end = None
+    cluster_id = -1
+    for i in order:
+        start, end, _ = spans[i]
+        if cluster_end is None or start >= cluster_end:
+            cluster_id += 1
+            cluster_cols.append(1)
+            col_ends = []
+            cluster_end = end
+        else:
+            cluster_end = max(cluster_end, end)
+        placed = False
+        for ci, col_end in enumerate(col_ends):
+            if col_end <= start:
+                col_ends[ci] = end
+                col_of[i] = ci
+                placed = True
+                break
+        if not placed:
+            col_ends.append(end)
+            col_of[i] = len(col_ends) - 1
+        cluster_of[i] = cluster_id
+        cluster_cols[cluster_id] = max(cluster_cols[cluster_id], len(col_ends))
+
+    cols_of = [cluster_cols[cluster_of[i]] for i in range(len(spans))]
+    return col_of, cols_of
+
+
+def _calendar_day_blocks(day, rows, undated, range_start, range_end):
+    """Timeline blocks for one day of the calendar (day view or one column of
+    the week grid) — shared so both read the same placement rules.
+
+    ``rows`` are tasks whose deadline falls on ``day`` (real day, real time);
+    ``undated`` are open tasks with no deadline at all, only ever passed for
+    today. A task's deadline time of ``23:59``/``00:00`` is treated as a
+    day-boundary marker rather than a real scheduled time (that's what "by
+    end of day" resolves to) — like an undated task, it gets a stable
+    per-task random slot instead of pinning to the boundary, labelled
+    ``~HH:MM`` rather than a real time. Returns ``blocks`` ready for
+    DayTimelineView/WeekTimelineView, with side-by-side "col"/"cols" already
+    assigned via ``_layout_columns``.
+    """
+    span_seconds = (range_end - range_start).total_seconds()
+    now = datetime.now()
+
+    def frac(dt):
+        return max(0.0, min(1.0, (dt - range_start).total_seconds() / span_seconds))
+
+    spans = []
+    for task in rows:
+        deadline = _naive(task["deadline"])
+        duration = float(task.get("estimated_duration") or CAL_DEFAULT_BLOCK_MIN)
+        if (deadline.hour, deadline.minute) in ((23, 59), (0, 0)):
+            rng = random.Random(int(task["id"]) * 1_000_003 + day.toordinal() * 7 + 1)
+            start_dt = range_start + timedelta(
+                seconds=rng.random() * max(0.0, span_seconds - duration * 60))
+            spans.append((start_dt, start_dt + timedelta(minutes=duration), task, True))
+        else:
+            spans.append((deadline - timedelta(minutes=duration), deadline, task, False))
+    for task in undated:
+        duration = float(task.get("estimated_duration") or CAL_DEFAULT_BLOCK_MIN)
+        rng = random.Random(int(task["id"]) * 1_000_003 + day.toordinal() * 7 + 2)
+        window_start = max(range_start, now)
+        window = max(0.0, (range_end - window_start).total_seconds() - duration * 60)
+        start_dt = window_start + timedelta(seconds=rng.random() * window)
+        spans.append((start_dt, start_dt + timedelta(minutes=duration), task, True))
+
+    col_of, cols_of = _layout_columns([(s, e, t) for s, e, t, _ in spans])
+
+    blocks = []
+    for i, (start_dt, end_dt, task, approx) in enumerate(spans):
+        sf = frac(start_dt)
+        label = _time_range_label(start_dt, end_dt)
+        blocks.append({
+            "title": task["description"],
+            "label": f"~{label}" if approx else label,
+            "start_frac": sf,
+            "end_frac": max(sf + 0.02, frac(end_dt)),
+            "col": col_of[i],
+            "cols": cols_of[i],
+            "rgb": _CAL_CATEGORY_COLOR.get(task.get("category"), _CAL_PALETTE[0]),
+        })
+    return blocks
 
 
 # column widths (characters, monospace) for the full task-list table
 _COL_ORDER_W = 3
 _COL_DESC_W = 20
 _COL_DEADLINE_W = 8
-_COL_REPEAT_W = 10
 # Phase 5: LLM labels — widths fit every value in llm_labels.CATEGORIES /
 # ENERGY_LEVELS without eliding ("deep_computer"/"physical_home" are the
 # longest categories at 13; "medium" the longest energy level at 6)
 _COL_CATEGORY_W = 13
 _COL_ENERGY_W = 6
-_TABLE_ROW_W = (_COL_ORDER_W + _COL_DESC_W + _COL_DEADLINE_W + _COL_REPEAT_W
-                + _COL_CATEGORY_W + _COL_ENERGY_W + 5 * len(" | "))
+_TABLE_ROW_W = (_COL_ORDER_W + _COL_DESC_W + _COL_DEADLINE_W
+                + _COL_CATEGORY_W + _COL_ENERGY_W + 4 * len(" | "))
 
 
-def _table_row(order: str, desc: str, deadline: str, repeat: str,
+def _table_row(order: str, desc: str, deadline: str,
                 category: str, energy: str) -> str:
     return (f"{str(order).rjust(_COL_ORDER_W)} | "
             f"{_elide(desc, _COL_DESC_W).ljust(_COL_DESC_W)} | "
             f"{deadline.ljust(_COL_DEADLINE_W)} | "
-            f"{_elide(repeat, _COL_REPEAT_W).ljust(_COL_REPEAT_W)} | "
             f"{_elide(category, _COL_CATEGORY_W).ljust(_COL_CATEGORY_W)} | "
             f"{energy.ljust(_COL_ENERGY_W)}")
 
@@ -395,7 +590,7 @@ class TaskRow(NSView):
         # mouseDown_/mouseDragged_ would never fire
         self._text = ""
         self._color = _green(_BODY, 0.9)
-        self._desc = self._deadline_s = self._repeat_s = ""
+        self._desc = self._deadline_s = ""
         self._category_s = self._energy_s = ""
         self._drag_origin_y = 0.0
         self._frame_origin_y = 0.0
@@ -409,13 +604,13 @@ class TaskRow(NSView):
         ).drawAtPoint_(NSMakePoint(0, 1))
 
     @objc.python_method
-    def configure(self, controller, task_id, desc, deadline_s, repeat_s,
+    def configure(self, controller, task_id, desc, deadline_s,
                   category_s, energy_s, order, rgb, alpha):
         self.controller = controller
         self.task_id = task_id
         # kept so set_order() can redraw the row with just a new "#" as it
         # moves during a drag, without the controller re-fetching from Postgres
-        self._desc, self._deadline_s, self._repeat_s = desc, deadline_s, repeat_s
+        self._desc, self._deadline_s = desc, deadline_s
         self._category_s, self._energy_s = category_s, energy_s
         self._color = _green(rgb, alpha)
         self.set_order(order)
@@ -423,7 +618,7 @@ class TaskRow(NSView):
     @objc.python_method
     def set_order(self, order):
         self._text = _table_row(order, self._desc, self._deadline_s,
-                                 self._repeat_s, self._category_s, self._energy_s)
+                                 self._category_s, self._energy_s)
         self.setNeedsDisplay_(True)
 
     def mouseDown_(self, event):
@@ -697,6 +892,304 @@ class ChartView(NSView):
 
 
 # --------------------------------------------------------------------------
+# mouse activity map (spatial scatter of recorded positions)
+# --------------------------------------------------------------------------
+
+class MouseMapView(NSView):
+    """Positions from ``mouse_event`` plotted where they happened on screen —
+    dim dots for movement samples, brighter dots for clicks — scaled down
+    into the chart area against the main screen's resolution."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(MouseMapView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._points = []       # [{"x", "y", "kind"}]
+        self._screen_w = 1920.0
+        self._screen_h = 1080.0
+        self._caption = ""
+        self._empty = "no mouse activity yet"
+        return self
+
+    @objc.python_method
+    def set_data(self, points, screen_w, screen_h, caption, empty):
+        self._points = list(points)
+        self._screen_w = float(screen_w) or 1920.0
+        self._screen_h = float(screen_h) or 1080.0
+        self._caption = caption
+        self._empty = empty
+        self.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def _text(self, string, x, y, *, alpha=0.7, size=10.0):
+        NSAttributedString.alloc().initWithString_attributes_(
+            string,
+            {NSFontAttributeName: _ui_font(size),
+             NSForegroundColorAttributeName: _green(_BODY, alpha)},
+        ).drawAtPoint_(NSMakePoint(x, y))
+
+    def drawRect_(self, rect):
+        bounds = self.bounds()
+        w, h = bounds.size.width, bounds.size.height
+        NSColor.blackColor().set()
+        NSBezierPath.fillRect_(bounds)
+
+        m = 6
+        pw, ph = w - 2 * m, h - 2 * m
+        _green(_BODY, 0.25).set()
+        NSBezierPath.strokeRect_(NSMakeRect(m, m, pw, ph))
+
+        if not self._points:
+            self._text(self._empty, m + 10, m + ph / 2, alpha=0.5, size=11)
+            return
+
+        # NSEvent.mouseLocation() is bottom-left origin, same as this (flipped
+        # or not) view's default coordinate system, so plot x/y directly.
+        for p in self._points:
+            fx = min(1.0, max(0.0, p["x"] / self._screen_w))
+            fy = min(1.0, max(0.0, p["y"] / self._screen_h))
+            px = m + fx * pw
+            py = m + fy * ph
+            if p["kind"] == "click":
+                _green(_HEAD, 0.85).set()
+                r = 2.2
+            else:
+                _green(_BODY, 0.35).set()
+                r = 1.0
+            NSBezierPath.fillRect_(NSMakeRect(px - r, py - r, 2 * r, 2 * r))
+
+        if self._caption:
+            self._text(self._caption, m + 4, m + 3, alpha=0.6)
+
+
+# --------------------------------------------------------------------------
+# calendar day timeline (hour grid + proportional event blocks)
+# --------------------------------------------------------------------------
+
+class DayTimelineView(NSView):
+    """Hour-by-hour agenda for one day: gridlines + labels down the left
+    gutter, tasks as colored blocks positioned/sized by their time span
+    (overlapping ones split side by side via ``_layout_columns`` rather than
+    stacking on top of each other), and a red current-time line when the
+    shown day is today."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(DayTimelineView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._start_hour = CAL_DAY_START_HOUR
+        self._end_hour = CAL_DAY_END_HOUR
+        self._blocks = []      # [{"title", "label", "start_frac", "end_frac", "rgb"}]
+        self._now_frac = None
+        self._now_label = ""
+        return self
+
+    def isFlipped(self):
+        return True
+
+    @objc.python_method
+    def set_data(self, start_hour, end_hour, blocks, now_frac, now_label):
+        self._start_hour = start_hour
+        self._end_hour = end_hour
+        self._blocks = blocks
+        self._now_frac = now_frac
+        self._now_label = now_label
+        self.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def _text(self, string, x, y, *, rgb, alpha, size):
+        NSAttributedString.alloc().initWithString_attributes_(
+            string,
+            {NSFontAttributeName: _ui_font(size),
+             NSForegroundColorAttributeName: _green(rgb, alpha)},
+        ).drawAtPoint_(NSMakePoint(x, y))
+
+    def drawRect_(self, rect):
+        bounds = self.bounds()
+        w, h = bounds.size.width, bounds.size.height
+        NSColor.blackColor().set()
+        NSBezierPath.fillRect_(bounds)
+
+        gutter = CAL_GUTTER
+        hours = max(1, self._end_hour - self._start_hour)
+        px_per_hour = h / hours
+
+        for i in range(hours + 1):
+            y = i * px_per_hour
+            _green(_BODY, 0.15).set()
+            line = NSBezierPath.bezierPath()
+            line.moveToPoint_(NSMakePoint(gutter, y))
+            line.lineToPoint_(NSMakePoint(w, y))
+            line.setLineWidth_(0.5)
+            line.stroke()
+            if i < hours:
+                self._text(_hour_label(self._start_hour + i), 2, y + 3,
+                           rgb=_BODY, alpha=0.55, size=9.5)
+
+        for block in self._blocks:
+            y0 = block["start_frac"] * h
+            y1 = block["end_frac"] * h
+            bh = max(16.0, y1 - y0)
+            r, g, b = block["rgb"]
+
+            # tasks overlapping in time sit side by side rather than one on
+            # top of another: "col"/"cols" (from _layout_columns) split the
+            # available width into cols equal slices with a thin gap between
+            avail_w = w - gutter - 6
+            cols = max(1, block.get("cols", 1))
+            col = block.get("col", 0)
+            gap = 3.0 if cols > 1 else 0.0
+            col_w = (avail_w - gap * (cols - 1)) / cols
+            bx = gutter + 3 + col * (col_w + gap)
+
+            body = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(bx, y0, col_w, bh), 4, 4)
+            NSColor.colorWithDeviceRed_green_blue_alpha_(r, g, b, 0.30).set()
+            body.fill()
+            NSColor.colorWithDeviceRed_green_blue_alpha_(r, g, b, 0.95).set()
+            NSBezierPath.fillRect_(NSMakeRect(bx, y0, 3, bh))
+            max_chars = max(4, int((col_w - 10) / 6.2))
+            self._text(_elide(block["title"], max_chars), bx + 7, y0 + 3,
+                       rgb=(1.0, 1.0, 1.0), alpha=0.92, size=10.5)
+            if bh >= 20 and col_w >= 40:
+                self._text(block["label"], bx + 7, y0 + 17,
+                           rgb=(1.0, 1.0, 1.0), alpha=0.6, size=9)
+
+        if self._now_frac is not None:
+            y = self._now_frac * h
+            NSColor.colorWithDeviceRed_green_blue_alpha_(0.95, 0.25, 0.25, 0.95).set()
+            line = NSBezierPath.bezierPath()
+            line.moveToPoint_(NSMakePoint(gutter, y))
+            line.lineToPoint_(NSMakePoint(w, y))
+            line.setLineWidth_(1.2)
+            line.stroke()
+            NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(w - 6, y - 3, 6, 6)).fill()
+            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(2, y - 7, gutter - 8, 14), 3, 3).fill()
+            self._text(self._now_label, 5, y - 5,
+                       rgb=(1.0, 1.0, 1.0), alpha=1.0, size=9.5)
+
+
+class WeekTimelineView(NSView):
+    """7-day grid version of DayTimelineView: weekday-name columns across the
+    top over the same fixed hour grid, each day's blocks confined to its own
+    column (side by side, not stacked) so the week reads at a glance instead
+    of one line of truncated task names per day. Columns are too narrow for
+    the day view's detail, so blocks show a short title only — no time label
+    — and the current-time line is drawn across just today's column."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(WeekTimelineView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._start_hour = CAL_DAY_START_HOUR
+        self._end_hour = CAL_DAY_END_HOUR
+        self._day_labels = []      # 7 strings, e.g. "Mon"
+        self._today_index = None   # 0-6, or None if today isn't in view
+        self._columns = []         # 7 lists of blocks (see DayTimelineView)
+        self._now_frac = None
+        return self
+
+    def isFlipped(self):
+        return True
+
+    @objc.python_method
+    def set_data(self, start_hour, end_hour, day_labels, today_index, columns, now_frac):
+        self._start_hour = start_hour
+        self._end_hour = end_hour
+        self._day_labels = day_labels
+        self._today_index = today_index
+        self._columns = columns
+        self._now_frac = now_frac
+        self.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def _text(self, string, x, y, *, rgb, alpha, size):
+        NSAttributedString.alloc().initWithString_attributes_(
+            string,
+            {NSFontAttributeName: _ui_font(size),
+             NSForegroundColorAttributeName: _green(rgb, alpha)},
+        ).drawAtPoint_(NSMakePoint(x, y))
+
+    def drawRect_(self, rect):
+        bounds = self.bounds()
+        w, h = bounds.size.width, bounds.size.height
+        NSColor.blackColor().set()
+        NSBezierPath.fillRect_(bounds)
+
+        gutter = CAL_WEEK_GUTTER
+        header_h = CAL_WEEK_HEADER_H
+        hours = max(1, self._end_hour - self._start_hour)
+        grid_h = h - header_h
+        n_days = len(self._day_labels) or 7
+        col_w = (w - gutter) / n_days
+
+        if self._today_index is not None:
+            _green(_HEAD, 0.07).set()
+            NSBezierPath.fillRect_(NSMakeRect(
+                gutter + self._today_index * col_w, header_h, col_w, grid_h))
+
+        for i, label in enumerate(self._day_labels):
+            is_today = i == self._today_index
+            self._text(label, gutter + i * col_w + 3, 2,
+                       rgb=_HEAD if is_today else _BODY,
+                       alpha=1.0 if is_today else 0.6, size=8.5)
+
+        for i in range(hours + 1):
+            gy = header_h + i * (grid_h / hours)
+            _green(_BODY, 0.15).set()
+            line = NSBezierPath.bezierPath()
+            line.moveToPoint_(NSMakePoint(gutter, gy))
+            line.lineToPoint_(NSMakePoint(w, gy))
+            line.setLineWidth_(0.5)
+            line.stroke()
+            if i < hours:
+                self._text(_hour_label(self._start_hour + i), 1, gy + 2,
+                           rgb=_BODY, alpha=0.5, size=7.5)
+
+        for i in range(n_days + 1):
+            gx = gutter + i * col_w
+            _green(_BODY, 0.18).set()
+            line = NSBezierPath.bezierPath()
+            line.moveToPoint_(NSMakePoint(gx, header_h))
+            line.lineToPoint_(NSMakePoint(gx, h))
+            line.setLineWidth_(0.5)
+            line.stroke()
+
+        for day_i, blocks in enumerate(self._columns):
+            cx = gutter + day_i * col_w
+            for block in blocks:
+                y0 = header_h + block["start_frac"] * grid_h
+                y1 = header_h + block["end_frac"] * grid_h
+                bh = max(7.0, y1 - y0)
+                r, g, b = block["rgb"]
+                cols = max(1, block.get("cols", 1))
+                col = block.get("col", 0)
+                sub_w = (col_w - 2) / cols
+                bx = cx + 1 + col * sub_w
+
+                NSColor.colorWithDeviceRed_green_blue_alpha_(r, g, b, 0.35).set()
+                NSBezierPath.fillRect_(NSMakeRect(bx, y0, max(1.0, sub_w - 1), bh))
+                NSColor.colorWithDeviceRed_green_blue_alpha_(r, g, b, 0.95).set()
+                NSBezierPath.fillRect_(NSMakeRect(bx, y0, 2, bh))
+                if bh >= 8 and sub_w >= 12:
+                    max_chars = max(2, int((sub_w - 4) / 4.6))
+                    self._text(_elide(block["title"], max_chars), bx + 3, y0 + 1,
+                               rgb=(1.0, 1.0, 1.0), alpha=0.92, size=6.5)
+
+        if self._now_frac is not None and self._today_index is not None:
+            gy = header_h + self._now_frac * grid_h
+            x0 = gutter + self._today_index * col_w
+            NSColor.colorWithDeviceRed_green_blue_alpha_(0.95, 0.25, 0.25, 0.95).set()
+            line = NSBezierPath.bezierPath()
+            line.moveToPoint_(NSMakePoint(x0, gy))
+            line.lineToPoint_(NSMakePoint(x0 + col_w, gy))
+            line.setLineWidth_(1.2)
+            line.stroke()
+
+
+# --------------------------------------------------------------------------
 # controller: status item + popover + all actions
 # --------------------------------------------------------------------------
 
@@ -710,27 +1203,20 @@ class MenuController(NSObject):
         self._last_generated = None
         self._ticks = 0
         # "tracking" | "transition" | "form" | "stats" | "timer" | "settings"
-        # | "tasklist" | "jobsearch" | "jobstable"
+        # | "tasklist" | "jobsearch" | "jobstable" | "calendar"
         self._screen = "tracking"
-        # row index of the first task shown in the tasks-list window; the
-        # up/down arrows slide this by TASKLIST_SCROLL_STEP, not a full page
-        self._task_list_offset = 0
         # which screen to return to on the tasks-list "‹ back" button — set
         # by openTaskList_ to whichever screen ("tracking" or "timer") it was
         # opened from
         self._tasklist_return_screen = "tracking"
-        # drag-to-reorder state for the tasks-list window: the current
-        # page's task ids in on-screen order (mutated live while dragging),
-        # their TaskRow views, the geometry of that row band, and the ids
-        # before/after this page in the full list — reorder_tasks() gets
-        # before + (dragged page's new order) + after, splicing the page's
-        # new order back into its place in the full list
+        # drag-to-reorder state for the tasks-list window: every open task's
+        # id in on-screen order (mutated live while dragging), their TaskRow
+        # views, and the geometry of the row band — reorder_tasks() gets this
+        # order directly, the whole list being shown at once now
         self._tasklist_row_order = []
         self._tasklist_row_views = {}
         self._tasklist_row_top = 0.0
         self._tasklist_row_step = 16.0
-        self._tasklist_before_ids = []
-        self._tasklist_after_ids = []
         self._drag_task_id = None
         self._drag_moved = False
         # job-search stopwatch: manually started, pausable, resets to 0 when
@@ -752,6 +1238,12 @@ class MenuController(NSObject):
         self._jobsearch_compact = False
         self._content_w = PANEL_W       # popover width; screens may override it
         self._jobtable_page = 0
+        # calendar screen: "day" shows self._cal_anchor itself, "week" shows
+        # the 7 days starting at self._cal_anchor (always a Monday in that mode)
+        self._cal_mode = "day"
+        self._cal_anchor = date.today()
+        self._daytimeline = None
+        self._weektimeline = None
         self._flash_msg = ""
         self._flash_until = 0.0
         self._form_err = ""
@@ -760,11 +1252,12 @@ class MenuController(NSObject):
         self._header = None
         self._transition_timer = None
         self._transition_target = "form"
-        self._stats_metric = "cpm"          # "cpm" | "diff"
+        self._stats_metric = "cpm"          # "cpm" | "diff" | "mouse"
         self._stats_window = keys.STATS_WINDOW_MINUTES   # minutes; 1h/2h/6h/12h
         self._diff_cap = keys.DIFF_HIST_CAP_MS           # diff chart x upper bound (ms)
         self._cpm_ma = 20                                # cpm rolling-average window (min)
         self._chart = None
+        self._mouse_map = None
         self._f_task = self._f_repeat = self._f_day = self._f_time = None
         self._f_entry = None
         self._f_entry_prev = ""          # last value seen, for the delete guard
@@ -781,6 +1274,7 @@ class MenuController(NSObject):
         self._tracking_rows = []
         self._tracking_total = 0
         self.tracker = keys.KeystrokeTracker()
+        self.mouse_tracker = mouse.MouseTracker()
 
         self.view = MatrixView.alloc().initWithFrame_(NSMakeRect(0, 0, PANEL_W, 420))
         self.vc = NSViewController.alloc().init()
@@ -833,11 +1327,23 @@ class MenuController(NSObject):
         NSRunLoop.currentRunLoop().addTimer_forMode_(flush, NSRunLoopCommonModes)
         self._flush_timer = flush
 
+        # Mouse tracking: global move (throttled) + click monitoring, RAM
+        # buffer -> Postgres every 60s (app/mouse.py), same shape as above.
+        self.mouse_tracker.start()
+        mouse_flush = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            MOUSE_FLUSH_SECONDS, self, "flushMouse:", None, True
+        )
+        NSRunLoop.currentRunLoop().addTimer_forMode_(mouse_flush, NSRunLoopCommonModes)
+        self._mouse_flush_timer = mouse_flush
+
         self._startup()
         return self
 
     def flushKeystrokes_(self, timer):
         self.tracker.flush()
+
+    def flushMouse_(self, timer):
+        self.mouse_tracker.flush()
 
     @objc.python_method
     def _hotkey_fired(self):
@@ -1195,6 +1701,26 @@ class MenuController(NSObject):
             self._flash("removed last application")
         self.rebuild()
 
+    def outreachAdd_(self, sender):
+        # "+" on the linkedin outreach counter — a plain per-day tally,
+        # unlike jobApplied_ it doesn't touch the stopwatch
+        try:
+            jobsearch.log_outreach()
+        except Exception as exc:  # noqa: BLE001
+            self._flash(f"err: {exc}")
+        self.rebuild()
+
+    def outreachRemove_(self, sender):
+        try:
+            removed = jobsearch.remove_last_outreach()
+        except Exception as exc:  # noqa: BLE001
+            self._flash(f"err: {exc}")
+            self.rebuild()
+            return
+        if removed:
+            self._flash("removed last outreach")
+        self.rebuild()
+
     def jobSearchBack_(self, sender):
         self._jobsearch_compact = False
         self._screen = "tracking"
@@ -1233,9 +1759,49 @@ class MenuController(NSObject):
         self._jobtable_page += 1
         self.rebuild()
 
+    # -- calendar -----------------------------------------------------
+
+    def openCalendar_(self, sender):
+        self._cancel_transition()
+        today = date.today()
+        self._cal_anchor = today if self._cal_mode == "day" else calendar_view.week_start(today)
+        self._screen = "calendar"
+        self.rebuild()
+
+    def calendarBack_(self, sender):
+        self._screen = "tracking"
+        self.rebuild()
+
+    def calendarMode_(self, sender):
+        # tag 0 = day, 1 = week; switching to week re-anchors on that day's
+        # Monday, switching back to day just shows whichever day is anchored
+        mode = "day" if int(sender.tag()) == 0 else "week"
+        if mode != self._cal_mode:
+            if mode == "week":
+                self._cal_anchor = calendar_view.week_start(self._cal_anchor)
+            self._cal_mode = mode
+            self.rebuild()
+
+    def calendarPrev_(self, sender):
+        step = timedelta(days=1 if self._cal_mode == "day" else 7)
+        self._cal_anchor -= step
+        self.rebuild()
+
+    def calendarNext_(self, sender):
+        step = timedelta(days=1 if self._cal_mode == "day" else 7)
+        self._cal_anchor += step
+        self.rebuild()
+
+    def calendarToday_(self, sender):
+        today = date.today()
+        self._cal_anchor = today if self._cal_mode == "day" else calendar_view.week_start(today)
+        self.rebuild()
+
     def quit_(self, sender):
         self.tracker.flush()
         self.tracker.stop()
+        self.mouse_tracker.flush()
+        self.mouse_tracker.stop()
         NSApplication.sharedApplication().terminate_(self)
 
     @objc.python_method
@@ -1282,17 +1848,7 @@ class MenuController(NSObject):
         # button below returns there instead of always going to tracking
         if self._screen in ("tracking", "timer"):
             self._tasklist_return_screen = self._screen
-        self._task_list_offset = 0
         self._screen = "tasklist"
-        self.rebuild()
-
-    def taskListDown_(self, sender):
-        # upper bound is clamped in _build_tasklist, where the row count is known
-        self._task_list_offset += TASKLIST_SCROLL_STEP
-        self.rebuild()
-
-    def taskListUp_(self, sender):
-        self._task_list_offset = max(0, self._task_list_offset - TASKLIST_SCROLL_STEP)
         self.rebuild()
 
     def taskListBack_(self, sender):
@@ -1300,13 +1856,24 @@ class MenuController(NSObject):
         self.rebuild()
 
     def taskListComplete_(self, sender):
-        # the "X" at the end of a row: complete it right here, no fade
-        # animation (that's a tracking-screen-only affordance) — just refetch
-        # and reflow the table
+        # the "X" at the end of a row: permanently deletes the task (not a
+        # completion — there's no undo, unlike the tracking screen's checkbox)
         task_id = int(sender.tag())
         try:
-            tasks.complete_task(task_id)
-            self._flash("task done ✓")
+            tasks.delete_task(task_id)
+            self._flash("task deleted")
+        except Exception as exc:  # noqa: BLE001
+            self._flash(f"err: {exc}")
+        self.rebuild()
+
+    def taskListClear_(self, sender):
+        # "clear": wipes every open task. Recurring templates
+        # (recurring_tasks) aren't touched, so a repeating task simply comes
+        # back next time recurring.generate_due_tasks() is due to make it —
+        # only today's already-generated instance is removed.
+        try:
+            removed = tasks.clear_open_tasks()
+            self._flash(f"cleared {removed} task(s)")
         except Exception as exc:  # noqa: BLE001
             self._flash(f"err: {exc}")
         self.rebuild()
@@ -1349,12 +1916,11 @@ class MenuController(NSObject):
         # and refresh each row's leading "#" now that ranks have shifted
         top = self._tasklist_row_top
         step = self._tasklist_row_step
-        start = self._task_list_offset
         for i, task_id in enumerate(self._tasklist_row_order):
             view = self._tasklist_row_views.get(task_id)
             if view is None:
                 continue
-            view.set_order(start + i + 1)
+            view.set_order(i + 1)
             if task_id == dragging_id:
                 continue
             frame = view.frame()
@@ -1373,10 +1939,8 @@ class MenuController(NSObject):
 
         if not self._drag_moved:
             return  # a plain click, not a drag — leave the stored order alone
-        new_order = (self._tasklist_before_ids + self._tasklist_row_order
-                     + self._tasklist_after_ids)
         try:
-            tasks.reorder_tasks(new_order)
+            tasks.reorder_tasks(self._tasklist_row_order)
         except Exception as exc:  # noqa: BLE001
             self._flash(f"err: {exc}")
         self.rebuild()
@@ -1554,7 +2118,7 @@ class MenuController(NSObject):
     # -- stats screen ------------------------------------------
 
     def statsMetric_(self, sender):
-        self._stats_metric = "cpm" if int(sender.tag()) == 0 else "diff"
+        self._stats_metric = ("cpm", "diff", "mouse")[int(sender.tag())]
         self.rebuild()
 
     def statsWindow_(self, sender):
@@ -1582,6 +2146,21 @@ class MenuController(NSObject):
     def _ensure_chart(self):
         if self._chart is None:
             self._chart = ChartView.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
+
+    @objc.python_method
+    def _ensure_mouse_map(self):
+        if self._mouse_map is None:
+            self._mouse_map = MouseMapView.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
+
+    @objc.python_method
+    def _ensure_daytimeline(self):
+        if self._daytimeline is None:
+            self._daytimeline = DayTimelineView.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
+
+    @objc.python_method
+    def _ensure_weektimeline(self):
+        if self._weektimeline is None:
+            self._weektimeline = WeekTimelineView.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
 
     @objc.python_method
     def _ensure_form_controls(self):
@@ -1797,6 +2376,8 @@ class MenuController(NSObject):
             y = self._build_jobsearch(y, separators)
         elif self._screen == "jobstable":
             y = self._build_jobstable(y, separators)
+        elif self._screen == "calendar":
+            y = self._build_calendar(y, separators)
         elif self._screen == "transition":
             y = self._build_transition(y)
         else:
@@ -1861,9 +2442,10 @@ class MenuController(NSObject):
         # typed in the last few seconds may not show up until that tick.
         self._header = None
 
+        subtitle = "mouse activity" if self._stats_metric == "mouse" else "keystroke activity"
         self.view.addSubview_(self._label(
             NSMakeRect(PAD, y, PANEL_W - 2 * PAD, 36),
-            "STATS\n  keystroke activity", size=13, rgb=_HEAD, alpha=1.0, lines=2))
+            f"STATS\n  {subtitle}", size=13, rgb=_HEAD, alpha=1.0, lines=2))
         y += 42
         separators.append(y)
         y += 14
@@ -1887,7 +2469,9 @@ class MenuController(NSObject):
             x_ticks = self._clock_xticks(window)
             caption = ""
             empty = f"no characters typed in the last {wlabel}"
-        else:
+            if not self.tracker.permitted:
+                caption = "grant Accessibility permission + restart — see console"
+        elif metric == "diff":
             # distribution of the gap between consecutive keystrokes over the
             # same window as cpm — x-axis is gap duration, not clock time
             counts, edges, total, over = keys.interkey_diff_histogram(
@@ -1903,19 +2487,34 @@ class MenuController(NSObject):
             n = len(counts)
             x_ticks = [(i / (n + 1), f"{edges[i]:.0f}")
                        for i in (n // 4, n // 2, 3 * n // 4)]
-        if not self.tracker.permitted:
-            caption = "grant Accessibility permission + restart — see console"
+            if not self.tracker.permitted:
+                caption = "grant Accessibility permission + restart — see console"
+        else:  # "mouse" — spatial scatter of positions, not a bar chart
+            mouse_points = mouse.points(window)
+            screen = NSScreen.mainScreen()
+            sw, sh = (screen.frame().size.width, screen.frame().size.height) \
+                if screen is not None else (1920.0, 1080.0)
+            caption = f"{len(mouse_points)} points · {wlabel}"
+            empty = f"no mouse activity in the last {wlabel}"
+            if not self.mouse_tracker.permitted:
+                caption = "grant Accessibility permission + restart — see console"
 
         chart_h = 150
-        self._ensure_chart()
-        self._chart.setFrame_(NSMakeRect(PAD, y, PANEL_W - 2 * PAD, chart_h))
-        self._chart.set_data(values, vmax, top, caption, empty, x_ticks, overlay,
-                             y_step, overflow)
-        self.view.addSubview_(self._chart)
+        if metric == "mouse":
+            self._ensure_mouse_map()
+            self._mouse_map.setFrame_(NSMakeRect(PAD, y, PANEL_W - 2 * PAD, chart_h))
+            self._mouse_map.set_data(mouse_points, sw, sh, caption, empty)
+            self.view.addSubview_(self._mouse_map)
+        else:
+            self._ensure_chart()
+            self._chart.setFrame_(NSMakeRect(PAD, y, PANEL_W - 2 * PAD, chart_h))
+            self._chart.set_data(values, vmax, top, caption, empty, x_ticks, overlay,
+                                 y_step, overflow)
+            self.view.addSubview_(self._chart)
 
         # legend over the graph's top-left, styled like the task gradient
         ly = y + 4
-        for i, name in enumerate(("cpm", "diff")):
+        for i, name in enumerate(("cpm", "diff", "mouse")):
             selected = (metric == name)
             self.view.addSubview_(self._button(
                 NSMakeRect(PAD + 8, ly, 84, 18), name, "statsMetric:",
@@ -2055,6 +2654,7 @@ class MenuController(NSObject):
         half = (PANEL_W - 2 * PAD - 12) / 2
         grid = [
             ("Tasks", "openTaskList:"),
+            ("📅 Calendar", "openCalendar:"),
             ("▶ Pomodoro", "openPomodoro:"),
             ("▚ stats", "openStats:"),
             ("⌕ job search", "openJobSearch:"),
@@ -2132,11 +2732,9 @@ class MenuController(NSObject):
 
     @objc.python_method
     def _build_tasklist(self, y, separators):
-        # every open task as a compact table; only a handful of rows fit the
-        # popover at once, so the up/down arrows slide the visible window by
-        # TASKLIST_SCROLL_STEP rows rather than flipping a full page. Wider
-        # than the other screens (TASKLIST_PANEL_W) to fit the category/
-        # energy columns.
+        # every open task as a compact table, all shown at once (no paging) —
+        # the popover grows to fit them all. Wider than the other screens
+        # (TASKLIST_PANEL_W) to fit the category/energy columns.
         self._header = None
         self._content_w = TASKLIST_PANEL_W
         table_w = self._content_w - 2 * PAD
@@ -2157,17 +2755,13 @@ class MenuController(NSObject):
         y += 12
 
         total = len(rows)
-        max_offset = max(0, total - TASKLIST_PAGE_SIZE)
-        self._task_list_offset = max(0, min(self._task_list_offset, max_offset))
-        start = self._task_list_offset
-        page_rows = rows[start:start + TASKLIST_PAGE_SIZE]
 
         self.view.addSubview_(self._label(
             NSMakeRect(PAD, y, table_w, 12), rule, size=10, rgb=_BODY, alpha=0.4))
         y += 13
         self.view.addSubview_(self._label(
             NSMakeRect(PAD, y, table_w, 16),
-            _table_row("#", "Task", "Deadline", "Repeat", "Category", "Energy"),
+            _table_row("#", "Task", "Deadline", "Category", "Energy"),
             size=11, rgb=_HEAD, alpha=0.85))
         y += 16
         self.view.addSubview_(self._label(
@@ -2176,23 +2770,21 @@ class MenuController(NSObject):
 
         self._tasklist_row_order = []
         self._tasklist_row_views = {}
-        if not page_rows:
+        if not rows:
             self.view.addSubview_(self._label(
                 NSMakeRect(PAD, y, table_w, ROW_H),
                 "// no open tasks" if self._db_ok else "// no connection — reconnecting…",
                 rgb=_BODY, alpha=0.7))
             y += ROW_H
         else:
-            # click-and-drag a row to reorder it among its page-mates; the
-            # new order is written back once the drag ends (task_row_drag_ended).
-            # the row leaves room for an "X" at the end to complete it on the spot.
+            # click-and-drag a row to reorder it among the others; the new
+            # order is written back once the drag ends (task_row_drag_ended).
+            # the row leaves room for an "X" at the end to delete it on the spot.
             x_w, x_gap = 20, 4
             row_w = table_w - x_w - x_gap
             self._tasklist_row_top = y
             self._tasklist_row_step = 16.0
-            self._tasklist_before_ids = [int(r["id"]) for r in rows[:start]]
-            self._tasklist_after_ids = [int(r["id"]) for r in rows[start + len(page_rows):]]
-            for i, task in enumerate(page_rows):
+            for i, task in enumerate(rows):
                 task_id = int(task["id"])
                 deadline = task.get("deadline")
                 deadline_s = f"{deadline:%m/%d}" if deadline else "—"
@@ -2202,8 +2794,7 @@ class MenuController(NSObject):
                 energy_s = task.get("energy") or "—"
                 row = TaskRow.alloc().initWithFrame_(NSMakeRect(PAD, y, row_w, 16))
                 row.configure(self, task_id, task["description"], deadline_s,
-                              _repeat_label(task.get("recurrence")),
-                              category_s, energy_s, start + i + 1,
+                              category_s, energy_s, i + 1,
                               _BODY, 0.9)
                 self.view.addSubview_(row)
                 self._tasklist_row_order.append(task_id)
@@ -2216,35 +2807,19 @@ class MenuController(NSObject):
 
         y += 10
         separators.append(y)
-        y += 12
-
-        # up/down arrows slide the window by TASKLIST_SCROLL_STEP rows, dimmed
-        # once the window hits either end of the list
-        half = (table_w - 12) / 2
-        self.view.addSubview_(self._button(
-            NSMakeRect(PAD, y, half, 20), "▴ up", "taskListUp:",
-            rgb=_BODY, alpha=0.85 if start > 0 else 0.25))
-        self.view.addSubview_(self._button(
-            NSMakeRect(PAD + half + 12, y, half, 20), "▾ down", "taskListDown:",
-            rgb=_BODY, alpha=0.85 if start < max_offset else 0.25))
-        y += 24
-        row_range = f"{start + 1}-{start + len(page_rows)}" if page_rows else "0"
-        self.view.addSubview_(self._label(
-            NSMakeRect(PAD, y, table_w, 12),
-            f"{row_range} / {total}", size=9,
-            rgb=_BODY, alpha=0.4, align=NSTextAlignmentCenter))
-        y += 16
-
-        separators.append(y)
         y += 14
+        third = (table_w - 2 * 10) / 3
         self.view.addSubview_(self._button(
-            NSMakeRect(PAD, y, half, ROW_H), "‹ back", "taskListBack:",
+            NSMakeRect(PAD, y, third, ROW_H), "‹ back", "taskListBack:",
             rgb=_BODY, alpha=0.8))
         self.view.addSubview_(self._button(
-            NSMakeRect(PAD + half + 12, y, half, ROW_H), "+ add", "openForm:",
+            NSMakeRect(PAD + third + 10, y, third, ROW_H), "clear", "taskListClear:",
+            rgb=_BODY, alpha=0.55 if total else 0.25))
+        self.view.addSubview_(self._button(
+            NSMakeRect(PAD + 2 * (third + 10), y, third, ROW_H), "+ add", "openForm:",
             rgb=_HEAD, alpha=0.95))
         y += ROW_H
-        return SHEET_H
+        return max(SHEET_H, y + PAD)
 
     @objc.python_method
     def _stopwatch_text(self):
@@ -2263,41 +2838,60 @@ class MenuController(NSObject):
         if self._jobsearch_compact:
             return self._build_jobsearch_compact()
 
-        count = 0
+        applied = outreach = 0
         if self._db_ok:
             try:
-                count = jobsearch.count_today()
+                applied = jobsearch.count_today()
+                outreach = jobsearch.outreach_count_today()
             except Exception:  # noqa: BLE001
                 self._db_ok = False
 
         self.view.addSubview_(self._label(
             NSMakeRect(PAD, y, PANEL_W - 2 * PAD, 36),
-            "JOB SEARCH\n  time-boxed applications", size=13, rgb=_HEAD,
+            "JOB SEARCH\n  applications & outreach", size=13, rgb=_HEAD,
             alpha=1.0, lines=2))
         y += 42
         separators.append(y)
         y += 14
 
-        self.view.addSubview_(self._label(
-            NSMakeRect(0, y, PANEL_W, 16), "jobs applied today", size=12,
-            rgb=_HEAD, alpha=0.6, align=NSTextAlignmentCenter))
-        y += 24
+        # two side-by-side counters, each its own "-" / count / "+" — jobs
+        # applied (left, tied to the stopwatch below via jobApplied_) and
+        # linkedin outreach (right, a plain per-day tally)
+        col_gap = 12
+        col_w = (PANEL_W - 2 * PAD - col_gap) / 2
+        col1_x, col2_x = PAD, PAD + col_w + col_gap
 
-        # "-" undoes the last logged application (jobsearch.remove_last_application);
-        # "+" logs one the same way "+ applied" used to (jobApplied_) — both
-        # flank the count so it reads as a plain increment/decrement counter
-        count_h, side_w = 42, 32
+        self.view.addSubview_(self._label(
+            NSMakeRect(col1_x, y, col_w, 28), "jobs\napplied", size=11.5,
+            rgb=_HEAD, alpha=0.6, lines=2, align=NSTextAlignmentCenter))
+        self.view.addSubview_(self._label(
+            NSMakeRect(col2_x, y, col_w, 28), "linkedin\noutreach", size=11.5,
+            rgb=_HEAD, alpha=0.6, lines=2, align=NSTextAlignmentCenter))
+        y += 32
+
+        count_h, side_w = 38, 28
         side_y = y + (count_h - side_w) / 2
         self.view.addSubview_(self._button(
-            NSMakeRect(PAD, side_y, side_w, side_w), "-",
+            NSMakeRect(col1_x, side_y, side_w, side_w), "-",
             "jobApplicationRemove:", rgb=_BODY,
-            alpha=0.85 if count > 0 else 0.3, align=NSTextAlignmentCenter))
+            alpha=0.85 if applied > 0 else 0.3, align=NSTextAlignmentCenter))
         self.view.addSubview_(self._label(
-            NSMakeRect(0, y, PANEL_W, count_h), str(count), size=34,
+            NSMakeRect(col1_x, y, col_w, count_h), str(applied), size=28,
             rgb=_HEAD, alpha=1.0, align=NSTextAlignmentCenter))
         self.view.addSubview_(self._button(
-            NSMakeRect(PANEL_W - PAD - side_w, side_y, side_w, side_w), "+",
+            NSMakeRect(col1_x + col_w - side_w, side_y, side_w, side_w), "+",
             "jobApplied:", rgb=_HEAD, alpha=1.0, align=NSTextAlignmentCenter))
+
+        self.view.addSubview_(self._button(
+            NSMakeRect(col2_x, side_y, side_w, side_w), "-",
+            "outreachRemove:", rgb=_BODY,
+            alpha=0.85 if outreach > 0 else 0.3, align=NSTextAlignmentCenter))
+        self.view.addSubview_(self._label(
+            NSMakeRect(col2_x, y, col_w, count_h), str(outreach), size=28,
+            rgb=_HEAD, alpha=1.0, align=NSTextAlignmentCenter))
+        self.view.addSubview_(self._button(
+            NSMakeRect(col2_x + col_w - side_w, side_y, side_w, side_w), "+",
+            "outreachAdd:", rgb=_HEAD, alpha=1.0, align=NSTextAlignmentCenter))
         y += count_h + 4
 
         if self._stopwatch_running:
@@ -2436,6 +3030,178 @@ class MenuController(NSObject):
             rgb=_BODY, alpha=0.8))
         y += ROW_H
         return SHEET_H
+
+    @objc.python_method
+    def _calendar_range_label(self):
+        today = date.today()
+        if self._cal_mode == "day":
+            d = self._cal_anchor
+            suffix = "  ·  today" if d == today else ""
+            return f"{d:%a, %b %d}{suffix}"
+        start = self._cal_anchor
+        end = start + timedelta(days=6)
+        if (start.year, start.month) == (end.year, end.month):
+            span = f"{start:%b %d} – {end:%d}"
+        elif start.year == end.year:
+            span = f"{start:%b %d} – {end:%b %d}"
+        else:
+            span = f"{start:%b %d, %Y} – {end:%b %d, %Y}"
+        this_week = calendar_view.week_start(today) == start
+        return f"{span}{'  ·  this week' if this_week else ''}"
+
+    @objc.python_method
+    def _build_calendar(self, y, separators):
+        self._header = None
+        # the week grid needs 7 columns' worth of room; the day view fits
+        # the normal panel width
+        self._content_w = CALENDAR_WEEK_PANEL_W if self._cal_mode == "week" else PANEL_W
+        content_w = self._content_w
+        table_w = content_w - 2 * PAD
+
+        self.view.addSubview_(self._label(
+            NSMakeRect(PAD, y, table_w, 20),
+            "CALENDAR", size=13, rgb=_HEAD, alpha=1.0))
+        y += 26
+        separators.append(y)
+        y += 12
+
+        # day/week toggle, styled like the stats screen's metric legend, plus
+        # a "today" shortcut at the row's right edge
+        for i, mode in enumerate(("day", "week")):
+            selected = self._cal_mode == mode
+            self.view.addSubview_(self._button(
+                NSMakeRect(PAD + i * 54, y, 50, 18), mode, "calendarMode:",
+                rgb=_HEAD if selected else _BODY,
+                alpha=1.0 if selected else 0.30, tag=i))
+        self.view.addSubview_(self._button(
+            NSMakeRect(content_w - PAD - 50, y, 50, 18), "today", "calendarToday:",
+            rgb=_BODY, alpha=0.55))
+        y += 26
+
+        # ‹ prev / range label / next › — slides by one day or one week
+        # depending on the mode above
+        self.view.addSubview_(self._button(
+            NSMakeRect(PAD, y, 28, 22), "‹", "calendarPrev:", rgb=_BODY, alpha=0.85))
+        self.view.addSubview_(self._label(
+            NSMakeRect(PAD + 30, y + 3, table_w - 60, 16),
+            self._calendar_range_label(), size=11.5, rgb=_HEAD, alpha=0.95,
+            align=NSTextAlignmentCenter))
+        self.view.addSubview_(self._button(
+            NSMakeRect(content_w - PAD - 28, y, 28, 22), "›", "calendarNext:",
+            rgb=_BODY, alpha=0.85))
+        y += 30
+
+        separators.append(y)
+        y += 12
+
+        if self._cal_mode == "day":
+            y = self._build_calendar_day(y, table_w)
+        else:
+            y = self._build_calendar_week(y, table_w)
+
+        y += 8
+        separators.append(y)
+        y += 14
+        self.view.addSubview_(self._button(
+            NSMakeRect(PAD, y, 80, ROW_H), "‹ back", "calendarBack:",
+            rgb=_BODY, alpha=0.8))
+        y += ROW_H
+        return y + PAD - 6
+
+    @objc.python_method
+    def _build_calendar_day(self, y, table_w):
+        rows: list[dict] = []
+        undated: list[dict] = []
+        is_today = self._cal_anchor == date.today()
+        if self._db_ok:
+            try:
+                rows = calendar_view.day_tasks(self._cal_anchor)
+                # nothing says which day an undated task belongs on, so it
+                # only ever shows up on today's timeline (see undated_tasks)
+                if is_today:
+                    undated = calendar_view.undated_tasks()
+            except Exception:  # noqa: BLE001
+                self._db_ok = False
+
+        if not self._db_ok:
+            self.view.addSubview_(self._label(
+                NSMakeRect(PAD, y, table_w, ROW_H),
+                "// no connection — reconnecting…", rgb=_BODY, alpha=0.7))
+            return y + ROW_H
+
+        # a fixed 9am-12am grid every day, always drawn even with no tasks,
+        # rather than resizing to fit whatever deadlines happen to fall today
+        start_hour, end_hour = CAL_DAY_START_HOUR, CAL_DAY_END_HOUR
+        range_start = datetime.combine(self._cal_anchor, dtime(hour=start_hour))
+        range_end = (datetime.combine(self._cal_anchor, dtime(hour=end_hour)) if end_hour < 24
+                     else datetime.combine(self._cal_anchor + timedelta(days=1), dtime()))
+        blocks = _calendar_day_blocks(self._cal_anchor, rows, undated, range_start, range_end)
+
+        now = datetime.now()
+        now_frac = now_label = None
+        if is_today and range_start <= now <= range_end:
+            now_frac = (now - range_start).total_seconds() / (range_end - range_start).total_seconds()
+            now_label = _fmt_clock(now)
+
+        grid_h = (end_hour - start_hour) * CAL_HOUR_PX
+        self._ensure_daytimeline()
+        self._daytimeline.setFrame_(NSMakeRect(PAD, y, table_w, grid_h))
+        self._daytimeline.set_data(start_hour, end_hour, blocks, now_frac, now_label or "")
+        self.view.addSubview_(self._daytimeline)
+        return y + grid_h
+
+    @objc.python_method
+    def _build_calendar_week(self, y, table_w):
+        by_day: dict = {}
+        undated: list[dict] = []
+        today = date.today()
+        # nothing says which day an undated task belongs on, so it only ever
+        # shows up under today's column — only fetch it if today's in view
+        today_in_view = self._cal_anchor <= today < self._cal_anchor + timedelta(days=7)
+        if self._db_ok:
+            try:
+                by_day = calendar_view.week_tasks(self._cal_anchor)
+                if today_in_view:
+                    undated = calendar_view.undated_tasks()
+            except Exception:  # noqa: BLE001
+                self._db_ok = False
+
+        if not self._db_ok:
+            self.view.addSubview_(self._label(
+                NSMakeRect(PAD, y, table_w, ROW_H),
+                "// no connection — reconnecting…", rgb=_BODY, alpha=0.7))
+            return y + ROW_H
+
+        start_hour, end_hour = CAL_DAY_START_HOUR, CAL_DAY_END_HOUR
+        day_labels = []
+        today_index = None
+        columns = []
+        now = datetime.now()
+        now_frac = None
+        for i in range(7):
+            day = self._cal_anchor + timedelta(days=i)
+            is_today = day == today
+            if is_today:
+                today_index = i
+            day_labels.append(f"{day:%a}")
+
+            range_start = datetime.combine(day, dtime(hour=start_hour))
+            range_end = (datetime.combine(day, dtime(hour=end_hour)) if end_hour < 24
+                         else datetime.combine(day + timedelta(days=1), dtime()))
+            blocks = _calendar_day_blocks(
+                day, by_day.get(day, []), undated if is_today else [],
+                range_start, range_end)
+            columns.append(blocks)
+            if is_today and range_start <= now <= range_end:
+                now_frac = (now - range_start).total_seconds() / (range_end - range_start).total_seconds()
+
+        grid_h = (end_hour - start_hour) * CAL_WEEK_HOUR_PX + CAL_WEEK_HEADER_H
+        self._ensure_weektimeline()
+        self._weektimeline.setFrame_(NSMakeRect(PAD, y, table_w, grid_h))
+        self._weektimeline.set_data(start_hour, end_hour, day_labels, today_index,
+                                    columns, now_frac)
+        self.view.addSubview_(self._weektimeline)
+        return y + grid_h
 
     @objc.python_method
     def _build_timer(self, y, separators):

@@ -75,3 +75,38 @@ def list_applications() -> list[dict[str, Any]]:
         ORDER BY ts DESC
         """
     )
+
+
+# -- LinkedIn outreach counter -----------------------------------------
+#
+# A second, simpler "+ / - " counter next to "jobs applied" on the Job
+# Search screen. Unlike job applications it isn't tied to the stopwatch —
+# just a per-day tally of outreach messages sent (connection requests,
+# InMails, comments, etc.), so each row is just a timestamp.
+
+def log_outreach() -> dict[str, Any]:
+    row = db.execute(
+        "INSERT INTO linkedin_outreach (ts) VALUES (now()) RETURNING *"
+    )
+    assert row is not None
+    return row
+
+
+def outreach_count_today() -> int:
+    row = db.query_one(
+        "SELECT COUNT(*) AS n FROM linkedin_outreach WHERE ts::date = CURRENT_DATE"
+    )
+    return int(row["n"]) if row else 0
+
+
+def remove_last_outreach() -> bool:
+    """Undo the most recent outreach "+" click from today. Returns False
+    (no-op) if there were none today to remove."""
+    row = db.query_one(
+        "SELECT id FROM linkedin_outreach WHERE ts::date = CURRENT_DATE "
+        "ORDER BY ts DESC LIMIT 1"
+    )
+    if row is None:
+        return False
+    db.execute("DELETE FROM linkedin_outreach WHERE id = %s", (row["id"],))
+    return True
